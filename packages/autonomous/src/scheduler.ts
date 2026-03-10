@@ -8,10 +8,10 @@
  * Runs as a set of cron jobs alongside the main bridge process.
  */
 
-import cron from 'node-cron'
+import * as cron from 'node-cron'
 import { ConversationEngine, ProactiveTrigger } from '@openlove/core'
-import { MusicEngine, TrackInfo } from './music.js'
-import { DramaEngine, EpisodeInfo } from './drama.js'
+import { MusicEngine } from './music.js'
+import { DramaEngine } from './drama.js'
 
 export interface SchedulerConfig {
   engine: ConversationEngine

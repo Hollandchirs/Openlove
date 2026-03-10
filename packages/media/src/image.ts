@@ -94,9 +94,8 @@ export class ImageEngine {
         face_image_url: base64Image,
         guidance_scale: 7.5,
         num_inference_steps: 30,
-        num_images: 1,
       },
-    }) as { images: Array<{ url: string }> }
+    }) as unknown as { images: Array<{ url: string }> }
 
     if (!result.images?.[0]?.url) return null
     return await fetchImageAsBuffer(result.images[0].url)
@@ -113,7 +112,7 @@ export class ImageEngine {
         guidance_scale: 3.5,
         num_inference_steps: 28,
       },
-    }) as { images: Array<{ url: string }> }
+    }) as unknown as { images: Array<{ url: string }> }
 
     if (!result.images?.[0]?.url) return null
     return await fetchImageAsBuffer(result.images[0].url)

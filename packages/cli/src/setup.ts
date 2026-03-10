@@ -14,7 +14,7 @@ import inquirer from 'inquirer'
 import chalk from 'chalk'
 import ora from 'ora'
 import boxen from 'boxen'
-import { writeFileSync, existsSync, readFileSync } from 'fs'
+import { writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync } from 'fs'
 import { join } from 'path'
 
 const ROOT_DIR = process.cwd()
@@ -356,9 +356,6 @@ async function generateBlueprintFiles(
   characterName: string,
   answers: Record<string, string>
 ): Promise<void> {
-  const { mkdirSync, writeFileSync } = await import('fs')
-  const { join } = await import('path')
-
   const dir = join(ROOT_DIR, 'characters', characterName)
   mkdirSync(dir, { recursive: true })
 
@@ -443,8 +440,6 @@ function getMbtiVoice(mbti: string): string {
 }
 
 function getExistingCharacters(): string[] {
-  const { existsSync, readdirSync } = require('fs')
-  const { join } = require('path')
   const charactersDir = join(ROOT_DIR, 'characters')
   if (!existsSync(charactersDir)) return []
   try {

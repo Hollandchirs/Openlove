@@ -11,8 +11,7 @@
  */
 
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts'
-import OpenAI from 'openai'
-import FormData from 'form-data'
+import OpenAI, { toFile } from 'openai'
 
 export interface VoiceConfig {
   elevenLabsApiKey?: string
@@ -135,7 +134,6 @@ export class VoiceEngine {
     }
 
     try {
-      const { toFile } = await import('openai')
       const file = await toFile(audioBuffer, 'audio.ogg', { type: 'audio/ogg' })
 
       const response = await this.openai.audio.transcriptions.create({

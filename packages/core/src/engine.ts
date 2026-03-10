@@ -124,12 +124,12 @@ export class ConversationEngine {
     let prompt: string
     switch (trigger.type) {
       case 'music':
-        prompt = `You just finished listening to "${trigger.data.track}" by ${trigger.data.artist}. ` +
+        prompt = `You just finished listening to "${trigger.data?.track ?? 'a song'}" by ${trigger.data?.artist ?? 'an artist'}. ` +
           `You want to share something about it with the user. Keep it natural and brief, like a text message. ` +
           `Maybe share a lyric, how it made you feel, or a memory it triggered.`
         break
       case 'drama':
-        prompt = `You just watched episode ${trigger.data.episode} of "${trigger.data.show}". ` +
+        prompt = `You just watched episode ${trigger.data?.episode ?? 'the latest'} of "${trigger.data?.show ?? 'a show you\'re watching'}". ` +
           `You have strong feelings about it and want to text the user about it. ` +
           `Be excited/frustrated/sad depending on what happened. Don't summarize the whole plot.`
         break

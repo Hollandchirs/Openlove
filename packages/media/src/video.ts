@@ -42,7 +42,7 @@ export class VideoEngine {
           resolution: '480p',
           aspect_ratio: '9:16',  // vertical for mobile feel
         },
-      }) as { video: { url: string } }
+      }) as unknown as { video: { url: string } }
 
       if (!result.video?.url) return null
 

@@ -10,8 +10,8 @@
     ".": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --banner.js '#!/usr/bin/env node'",
-    "dev": "tsup src/index.ts --format esm --banner.js '#!/usr/bin/env node' --watch",
+    "build": "tsup",
+    "dev": "tsup --watch",
     "setup": "node dist/index.js setup",
     "start": "node dist/index.js start",
     "create": "node dist/index.js create",
