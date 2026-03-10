@@ -1,20 +1,22 @@
 /**
- * Character Creation — Three paths to match any user's comfort level
+ * Character Creation — Three paths + sculpting + portrait generation
  *
- * Path A (30 seconds): Pick a preset → rename → done
- * Path B (2 minutes): Describe in one sentence → AI generates everything
- * Path C (advanced):  Manual editing of 4 markdown files
+ * Path A (30 sec–3 min): Pick archetype → sculpt look → generate portrait → done
+ * Path B (2–5 min):      Describe in words → AI generates everything → portrait
+ * Path C (advanced):     Start blank, edit files yourself
  *
  * Design principle: "light input, strong completion"
- * The user should feel like they made something real, with minimal effort.
+ * The sculpting phase makes users feel they created something real.
+ * The portrait makes it undeniable.
  */
 
 import inquirer from 'inquirer'
 import chalk from 'chalk'
 import ora from 'ora'
-import { writeFileSync, mkdirSync, existsSync, copyFileSync } from 'fs'
+import { writeFileSync, readFileSync, mkdirSync, existsSync, copyFileSync } from 'fs'
 import { join, extname } from 'path'
-import { PRESETS, CharacterPreset } from './presets.js'
+import { exec } from 'child_process'
+import { PRESETS, CharacterPreset, AppearanceConfig } from './presets.js'
 
 const ROOT_DIR = process.cwd()
 
@@ -22,12 +24,105 @@ export interface CreatedCharacter {
   folderName: string
   displayName: string
   gender: 'female' | 'male' | 'nonbinary'
-  hasPhoto: boolean
+  hasPortrait: boolean
+  falKey?: string  // collected during portrait step if not already in env
 }
 
-/**
- * Main entry point — shows path selector and routes accordingly.
- */
+interface SculptedConfig {
+  name: string
+  gender: 'female' | 'male' | 'nonbinary'
+  archetype: CharacterPreset
+  appearance: AppearanceConfig
+  personality: string[]
+  backstory: string
+}
+
+// ── HAIR / EYE / SKIN / BODY / FEATURE / FASHION OPTIONS ──────────────────
+
+const HAIR_COLORS = [
+  'Jet black',
+  'Dark brown',
+  'Warm honey brown',
+  'Platinum blonde',
+  'Rose pink',
+  'Cherry red / deep burgundy',
+  'Midnight blue-black',
+  'Ash silver / grey',
+  'Warm auburn / chestnut',
+  'Two-tone (dark roots, light ends)',
+]
+
+const EYE_COLORS = [
+  'Deep dark brown',
+  'Warm honey amber',
+  'Forest green',
+  'Ice blue / steel grey',
+  'Violet / amethyst',
+  'Golden cat-eye',
+]
+
+const SKIN_TONES = [
+  'Porcelain / pale fair',
+  'Ivory / light warm',
+  'Honey / warm medium',
+  'Caramel / olive medium',
+  'Deep golden brown',
+]
+
+const BODY_TYPES = [
+  'Petite and delicate',
+  'Slender and tall',
+  'Athletic and toned',
+  'Curvy and full',
+  'Lean and angular',
+]
+
+const SIGNATURE_FEATURES = [
+  'Beauty mark near the lip',
+  'Freckles across the nose',
+  'Fox-eye upturned shape',
+  'Long elegant eyelashes',
+  'Sharp defined jawline',
+  'Soft round cheeks',
+  'Double eyelid, very expressive',
+  'High cheekbones',
+  'Dimples when smiling',
+  'Small nose ring',
+  'Visible collarbone',
+  'Tattoo (partial or small)',
+  'Expressive arched eyebrows',
+]
+
+const FASHION_STYLES = [
+  'K-pop stage glam — polished, idol-ready, elegant',
+  'Y2K throwback — butterfly clips, crop tops, low rise',
+  'Dark academia — plaid, cardigans, vintage',
+  'Streetwear — oversized fits, sneakers, caps',
+  'Corporate siren — power blazers, minimal jewelry',
+  'Soft cottagecore — floral, linen, sundresses',
+  'Cyberpunk neon — tech wear, asymmetric, LED accessories',
+  'Gothic lolita — layered lace, dark florals, Victorian',
+  'Effortless grunge — band tees, ripped denim, silver rings',
+  'Ethereal fairy — sheer, flowy, natural earthy tones',
+]
+
+const PERSONALITY_TRAITS = [
+  'Tsundere — cold outside, warm inside',
+  'Yandere-lite — devoted, a little intense',
+  'Kuudere — cool and calm, secretly emotional',
+  'Chaotic good — unpredictable but always on your side',
+  'Big sister energy — protective, checks on you',
+  'Little devil — teases constantly, means no harm (much)',
+  'Quietly dangerous — you underestimate until you don\'t',
+  'Scholar type — always analyzing, reads the room',
+  'Sun energy — genuinely warm, lifts the mood',
+  'Melancholic romantic — feels everything deeply',
+  'No-filter — says exactly what she thinks',
+  'Gentle guardian — soft but fierce when it matters',
+]
+
+// ── MAIN ENTRY ─────────────────────────────────────────────────────────────
+
 export async function createCharacterFlow(
   llmApiKey?: string,
   llmProvider?: string
@@ -40,9 +135,9 @@ export async function createCharacterFlow(
     message: 'How do you want to create your companion?',
     choices: [
       {
-        name: '⚡  Pick a preset — ready in 30 seconds',
+        name: '⚡  Pick an archetype — sculpt the look, generate a portrait',
         value: 'preset',
-        short: 'Preset',
+        short: 'Archetype',
       },
       {
         name: '✍️   Describe them — AI builds the full character from your words',
@@ -58,53 +153,514 @@ export async function createCharacterFlow(
   }])
 
   switch (path) {
-    case 'preset':   return createFromPreset()
+    case 'preset':   return createFromPreset(llmApiKey, llmProvider)
     case 'describe': return createFromDescription(llmApiKey, llmProvider)
     case 'blank':    return createBlank()
   }
   throw new Error('unreachable')
 }
 
-// ── Path A: Preset ─────────────────────────────────────────────────────────
+// ── PATH A: ARCHETYPE + SCULPTING ──────────────────────────────────────────
 
-async function createFromPreset(): Promise<CreatedCharacter> {
-  // Show presets with emoji + vibe description
+async function createFromPreset(
+  apiKey?: string,
+  provider?: string
+): Promise<CreatedCharacter> {
+
+  // 1. Pick archetype
+  console.log(chalk.gray('\n  Pick your archetype. Everything else is customizable.\n'))
+
   const { presetId } = await inquirer.prompt([{
     type: 'list',
     name: 'presetId',
-    message: 'Choose your companion:',
+    message: 'Choose an archetype:',
     choices: PRESETS.map(p => ({
-      name: `${p.emoji}  ${p.label}\n     ${chalk.gray(p.description)}`,
+      name: `${p.emoji}  ${p.label}\n     ${chalk.gray(p.tagline)}`,
       value: p.id,
-      short: p.label.split('—')[0].trim(),
+      short: p.label,
     })),
   }])
 
   const preset = PRESETS.find(p => p.id === presetId)!
 
-  // Let them rename
+  // 2. Name
+  const defaultName = preset.id.charAt(0).toUpperCase() + preset.id.slice(1)
   const { customName } = await inquirer.prompt([{
     type: 'input',
     name: 'customName',
-    message: `Name your companion:`,
-    default: preset.id.charAt(0).toUpperCase() + preset.id.slice(1),
+    message: 'Name your companion:',
+    default: defaultName,
   }])
 
-  const displayName = customName.trim() || preset.id
-  const folderName = displayName.toLowerCase().replace(/\s+/g, '-')
+  const displayName = customName.trim() || defaultName
+  const folderName = displayName.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')
 
-  const spinner = ora(`Creating ${displayName}...`).start()
-  writeCharacterFiles(folderName, preset, displayName)
+  // 3. Sculpt
+  const { wantSculpt } = await inquirer.prompt([{
+    type: 'list',
+    name: 'wantSculpt',
+    message: 'How do you want to proceed?',
+    choices: [
+      { name: '⚡ Use default look — start immediately', value: false },
+      { name: '🎨 Sculpt the look — customize appearance, personality, backstory', value: true },
+    ],
+  }])
+
+  let appearance: AppearanceConfig = { ...preset.defaultAppearance }
+  let personality: string[] = [...preset.personalityDefaults]
+  let backstory = ''
+
+  if (wantSculpt) {
+    console.log(chalk.cyan('\n  ── Sculpting ───────────────────────────────────────\n'))
+    appearance = await sculptAppearance(preset)
+    personality = await pickPersonality(preset)
+    backstory = await pickBackstory(preset)
+  }
+
+  const config: SculptedConfig = {
+    name: displayName,
+    gender: preset.gender,
+    archetype: preset,
+    appearance,
+    personality,
+    backstory,
+  }
+
+  // 4. Portrait
+  const spinner = ora('Saving character files...').start()
+  const blueprint = buildBlueprintFromPreset(config)
+  writeCharacterFiles(folderName, blueprint)
   spinner.succeed(chalk.green(`${displayName} created!`))
 
-  // Photo prompt
-  const hasPhoto = await promptForPhoto(folderName, displayName)
+  const { hasPortrait, falKey } = await craftPortrait(config, folderName, apiKey, provider)
 
-  printCreationSuccess(folderName, displayName, 'preset')
-  return { folderName, displayName, gender: preset.gender, hasPhoto }
+  printCreationSuccess(folderName, displayName)
+  return { folderName, displayName, gender: preset.gender, hasPortrait, falKey }
 }
 
-// ── Path B: AI Description ─────────────────────────────────────────────────
+// ── SCULPTING PHASE ────────────────────────────────────────────────────────
+
+async function sculptAppearance(preset: CharacterPreset): Promise<AppearanceConfig> {
+  console.log(chalk.bold('  👁  Appearance\n'))
+
+  const { hairColor } = await inquirer.prompt([{
+    type: 'list',
+    name: 'hairColor',
+    message: 'Hair color:',
+    choices: [
+      ...HAIR_COLORS.map(c => ({ name: c, value: c.toLowerCase() })),
+      { name: `Keep preset: ${preset.defaultAppearance.hairColor}`, value: preset.defaultAppearance.hairColor },
+    ],
+    default: preset.defaultAppearance.hairColor,
+  }])
+
+  const { eyeColor } = await inquirer.prompt([{
+    type: 'list',
+    name: 'eyeColor',
+    message: 'Eye color:',
+    choices: [
+      ...EYE_COLORS.map(c => ({ name: c, value: c.toLowerCase() })),
+      { name: `Keep preset: ${preset.defaultAppearance.eyeColor}`, value: preset.defaultAppearance.eyeColor },
+    ],
+    default: preset.defaultAppearance.eyeColor,
+  }])
+
+  const { skinTone } = await inquirer.prompt([{
+    type: 'list',
+    name: 'skinTone',
+    message: 'Skin tone:',
+    choices: SKIN_TONES.map(c => ({ name: c, value: c.toLowerCase() })),
+    default: SKIN_TONES.findIndex(s => preset.defaultAppearance.skinTone.includes(s.split('/')[0].trim().toLowerCase())),
+  }])
+
+  const { bodyType } = await inquirer.prompt([{
+    type: 'list',
+    name: 'bodyType',
+    message: 'Body type:',
+    choices: BODY_TYPES.map(c => ({ name: c, value: c.toLowerCase() })),
+  }])
+
+  const { features } = await inquirer.prompt([{
+    type: 'checkbox',
+    name: 'features',
+    message: 'Signature features (pick up to 3):',
+    choices: SIGNATURE_FEATURES.map(f => ({
+      name: f,
+      value: f.toLowerCase(),
+      checked: preset.defaultAppearance.features.some(pf =>
+        f.toLowerCase().includes(pf.split(' ')[0].toLowerCase())
+      ),
+    })),
+    validate: (choices: string[]) =>
+      choices.length <= 3 ? true : 'Pick at most 3 features',
+  }])
+
+  const { fashionStyle } = await inquirer.prompt([{
+    type: 'list',
+    name: 'fashionStyle',
+    message: 'Fashion style:',
+    choices: FASHION_STYLES.map(s => ({ name: s, value: s.split(' — ')[0].toLowerCase() })),
+  }])
+
+  return { hairColor, eyeColor, skinTone, bodyType, features, fashionStyle }
+}
+
+async function pickPersonality(preset: CharacterPreset): Promise<string[]> {
+  console.log(chalk.bold('\n  💫  Personality\n'))
+
+  const { traits } = await inquirer.prompt([{
+    type: 'checkbox',
+    name: 'traits',
+    message: 'Pick 2–4 core personality traits:',
+    choices: PERSONALITY_TRAITS.map(t => ({
+      name: t,
+      value: t,
+      checked: preset.personalityDefaults.some(d =>
+        t.toLowerCase().includes(d.split(' ')[0].toLowerCase())
+      ),
+    })),
+    validate: (choices: string[]) =>
+      choices.length >= 2 && choices.length <= 4
+        ? true
+        : 'Pick 2 to 4 traits',
+  }])
+
+  return traits
+}
+
+async function pickBackstory(preset: CharacterPreset): Promise<string> {
+  console.log(chalk.bold('\n  📖  Backstory\n'))
+  console.log(chalk.gray('  Pick the defining moment. It shapes who they are now.\n'))
+
+  const { backstory } = await inquirer.prompt([{
+    type: 'list',
+    name: 'backstory',
+    message: 'Pick a key backstory moment:',
+    choices: [
+      ...preset.backstoryOptions.map(b => ({ name: b, value: b })),
+      { name: '✏️  Write my own...', value: '__custom__' },
+      { name: '⏭️  Skip for now', value: '' },
+    ],
+  }])
+
+  if (backstory === '__custom__') {
+    const { customBackstory } = await inquirer.prompt([{
+      type: 'input',
+      name: 'customBackstory',
+      message: 'Describe the key moment (1-2 sentences):',
+    }])
+    return customBackstory
+  }
+
+  return backstory
+}
+
+// ── PORTRAIT GENERATION ────────────────────────────────────────────────────
+
+async function craftPortrait(
+  config: SculptedConfig,
+  folderName: string,
+  apiKey?: string,
+  provider?: string
+): Promise<{ hasPortrait: boolean; falKey?: string }> {
+
+  console.log(chalk.bold('\n  📸  Portrait\n'))
+  console.log(chalk.gray(`  A portrait image makes ${config.name} feel real — and enables visual selfies.\n`))
+
+  const { choice } = await inquirer.prompt([{
+    type: 'list',
+    name: 'choice',
+    message: 'How do you want to create the portrait?',
+    choices: [
+      { name: '🎨 Generate with AI  (fal.ai — free credits on signup)', value: 'generate' },
+      { name: '📷 Upload a reference photo', value: 'upload' },
+      { name: '⏭️  Skip — add portrait later', value: 'skip' },
+    ],
+  }])
+
+  if (choice === 'skip') {
+    console.log(chalk.gray(`  → Add reference.jpg to characters/${folderName}/ anytime\n`))
+    return { hasPortrait: false }
+  }
+
+  if (choice === 'upload') {
+    const uploaded = await promptForPhotoUpload(folderName, config.name)
+    return { hasPortrait: uploaded }
+  }
+
+  // Generate with fal.ai
+  let falKey = process.env.FAL_KEY
+
+  if (!falKey) {
+    console.log(chalk.yellow('\n  👉 Get a free fal.ai key at: https://fal.ai → Dashboard → API Keys\n'))
+    const { inputKey } = await inquirer.prompt([{
+      type: 'password',
+      name: 'inputKey',
+      message: 'Paste your fal.ai API key (or press Enter to skip):',
+      mask: '*',
+    }])
+    if (!inputKey) {
+      console.log(chalk.gray('  Skipping portrait — add FAL_KEY to .env and run: pnpm create-character\n'))
+      return { hasPortrait: false }
+    }
+    falKey = inputKey
+  }
+
+  // Build and optionally AI-optimize the prompt
+  const basePrompt = buildPortraitPrompt(config)
+  let finalPrompt = basePrompt
+
+  if (apiKey) {
+    const optimizeSpinner = ora('✨ AI is crafting the portrait prompt...').start()
+    try {
+      finalPrompt = await optimizePortraitPrompt(basePrompt, config, apiKey, provider ?? 'anthropic')
+      optimizeSpinner.succeed('Portrait prompt ready')
+    } catch {
+      optimizeSpinner.warn('Using base prompt (AI optimization failed)')
+    }
+  }
+
+  console.log(chalk.gray(`\n  Portrait prompt:\n  ${chalk.italic(finalPrompt.slice(0, 120))}...\n`))
+
+  // Generate loop
+  const destPath = join(ROOT_DIR, 'characters', folderName, 'reference.jpg')
+  let attempts = 0
+
+  while (attempts < 3) {
+    const genSpinner = ora('🎨 Generating portrait... (15–25 seconds)').start()
+    try {
+      const imageUrl = await callFalGenerate(finalPrompt, falKey)
+      await downloadImage(imageUrl, destPath)
+      genSpinner.succeed(chalk.green('Portrait generated!'))
+
+      // Try to open it
+      openImage(destPath)
+      console.log(chalk.cyan(`  → Opening portrait: characters/${folderName}/reference.jpg\n`))
+
+      const { happy } = await inquirer.prompt([{
+        type: 'list',
+        name: 'happy',
+        message: 'How does the portrait look?',
+        choices: [
+          { name: '✅ Perfect — continue', value: 'yes' },
+          { name: '🔄 Generate again (different random seed)', value: 'regen' },
+          { name: '📷 Replace with my own photo', value: 'upload' },
+          { name: '⏭️  Use this one anyway', value: 'yes' },
+        ],
+      }])
+
+      if (happy === 'regen') {
+        attempts++
+        continue
+      }
+
+      if (happy === 'upload') {
+        await promptForPhotoUpload(folderName, config.name)
+      }
+
+      break
+
+    } catch (err: any) {
+      genSpinner.fail('Generation failed')
+      console.log(chalk.red(`  Error: ${err.message}`))
+
+      const { retry } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'retry',
+        message: 'Try again?',
+        default: true,
+      }])
+
+      if (!retry) {
+        return { hasPortrait: false, falKey }
+      }
+      attempts++
+    }
+  }
+
+  // Save the portrait prompt so user can regenerate later
+  writeFileSync(
+    join(ROOT_DIR, 'characters', folderName, 'portrait-prompt.txt'),
+    finalPrompt,
+    'utf-8'
+  )
+
+  return { hasPortrait: true, falKey }
+}
+
+function buildPortraitPrompt(config: SculptedConfig): string {
+  const { appearance, archetype, gender, personality } = config
+
+  const subject = gender === 'nonbinary' ? 'person' : gender === 'male' ? 'man' : 'woman'
+  const vibeHints = personality.slice(0, 2).map(p => p.split(' — ')[0].toLowerCase()).join(', ')
+
+  const parts = [
+    `ultra-detailed portrait of a ${appearance.bodyType} ${subject}`,
+    `${appearance.hairColor} hair`,
+    `${appearance.eyeColor} eyes`,
+    `${appearance.skinTone} skin tone`,
+    appearance.features.length > 0 ? appearance.features.join(', ') : '',
+    `wearing ${appearance.fashionStyle} style`,
+    archetype.portraitBase,
+    vibeHints,
+    'cinematic photography, ultra-detailed, 8k resolution, professional studio lighting, beautiful, editorial fashion, sharp focus',
+  ]
+
+  return parts.filter(Boolean).join(', ')
+}
+
+async function optimizePortraitPrompt(
+  basePrompt: string,
+  config: SculptedConfig,
+  apiKey: string,
+  provider: string
+): Promise<string> {
+  const system = `You are an expert at writing image generation prompts for portrait photography.
+Given a character description and base prompt, write an optimized FLUX/Stable Diffusion prompt.
+Rules: under 200 words, focus on visual details only, include quality tags, match the character's aesthetic.
+Return ONLY the prompt text — no explanation, no quotes.`
+
+  const userMsg = `Character: ${config.name}, ${config.gender}
+Archetype: ${config.archetype.label}
+Base prompt: ${basePrompt}
+
+Optimize this into a vivid, effective portrait generation prompt. Preserve all physical details.`
+
+  try {
+    if (provider === 'anthropic') {
+      const Anthropic = (await import('@anthropic-ai/sdk')).default
+      const client = new Anthropic({ apiKey })
+      const resp = await client.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 300,
+        system,
+        messages: [{ role: 'user', content: userMsg }],
+      })
+      const block = resp.content[0]
+      if (block.type === 'text') return block.text.trim()
+    }
+
+    if (provider === 'openai') {
+      const OpenAI = (await import('openai')).default
+      const client = new OpenAI({ apiKey })
+      const resp = await client.chat.completions.create({
+        model: 'gpt-4o-mini',
+        max_tokens: 300,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: userMsg },
+        ],
+      })
+      return resp.choices[0]?.message?.content?.trim() ?? basePrompt
+    }
+  } catch {
+    // fall through to return basePrompt
+  }
+
+  return basePrompt
+}
+
+async function callFalGenerate(prompt: string, falKey: string): Promise<string> {
+  const resp = await fetch('https://fal.run/fal-ai/flux/dev', {
+    method: 'POST',
+    headers: {
+      Authorization: `Key ${falKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      prompt,
+      image_size: 'portrait_4_3',
+      num_inference_steps: 28,
+      num_images: 1,
+      enable_safety_checker: true,
+    }),
+  })
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '')
+    throw new Error(`fal.ai error (${resp.status}): ${body.slice(0, 200)}`)
+  }
+
+  const data = await resp.json() as { images: Array<{ url: string }> }
+  if (!data.images?.[0]?.url) throw new Error('fal.ai returned no image URL')
+  return data.images[0].url
+}
+
+async function downloadImage(url: string, dest: string): Promise<void> {
+  const resp = await fetch(url)
+  if (!resp.ok) throw new Error(`Image download failed (${resp.status})`)
+  const buf = await resp.arrayBuffer()
+  writeFileSync(dest, Buffer.from(buf))
+}
+
+function openImage(filePath: string): void {
+  const cmd =
+    process.platform === 'darwin' ? `open "${filePath}"` :
+    process.platform === 'win32'  ? `start "" "${filePath}"` :
+    `xdg-open "${filePath}"`
+  exec(cmd, () => { /* ignore errors */ })
+}
+
+// ── BUILD BLUEPRINT FROM PRESET + SCULPTING ────────────────────────────────
+
+function buildBlueprintFromPreset(config: SculptedConfig): {
+  identity: string; soul: string; user: string; memory: string
+} {
+  const { archetype, name, appearance, personality, backstory } = config
+
+  // Replace default name with chosen name in all files
+  const renameIn = (text: string) =>
+    text
+      .replace(new RegExp(`# ${escapeRegex(archetype.id.charAt(0).toUpperCase() + archetype.id.slice(1))}`, 'g'), `# ${name}`)
+      .replace(new RegExp(`\\b${escapeRegex(archetype.id)}\\b`, 'gi'), name)
+      .replace(new RegExp(`\\b(Yuna|Valentina|Hana|Nyx|Hu Lan|Riot|Kai|Eli)\\b`, 'g'), name)
+
+  // Identity: replace appearance section with sculpted version
+  let identity = renameIn(archetype.identity)
+  const appearanceBlock = buildAppearanceBlock(appearance)
+
+  if (identity.includes('## Appearance')) {
+    identity = identity.replace(/## Appearance[\s\S]*$/, `## Appearance\n\n${appearanceBlock}`)
+  } else {
+    identity += `\n\n## Appearance\n\n${appearanceBlock}`
+  }
+
+  // Soul: prepend personality traits section
+  const traitsBlock = `## Core Personality Traits\n\n${personality.map(t => `- ${t}`).join('\n')}`
+  const soul = traitsBlock + '\n\n' + renameIn(archetype.soul)
+
+  // User: rename only
+  const user = renameIn(archetype.user)
+
+  // Memory: prepend backstory if chosen
+  let memory = renameIn(archetype.memory)
+  if (backstory) {
+    memory = `## Origin Moment\n\n${backstory}\n\n---\n\n` + memory
+  }
+
+  return { identity, soul, user, memory }
+}
+
+function buildAppearanceBlock(app: AppearanceConfig): string {
+  const lines: string[] = []
+  lines.push(`${capitalize(app.hairColor)} hair. ${capitalize(app.eyeColor)} eyes.`)
+  lines.push(`${capitalize(app.skinTone)} skin. ${capitalize(app.bodyType)} build.`)
+  if (app.features.length > 0) {
+    lines.push(`Signature: ${app.features.map(capitalize).join(', ')}.`)
+  }
+  lines.push(`Style: ${capitalize(app.fashionStyle)}.`)
+  return lines.join('\n')
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// ── PATH B: AI DESCRIPTION ─────────────────────────────────────────────────
 
 async function createFromDescription(
   apiKey?: string,
@@ -119,15 +675,15 @@ async function createFromDescription(
 
   console.log(chalk.gray('\n  Just describe who you want. The AI will build everything else.\n'))
   console.log(chalk.gray('  Examples:'))
-  console.log(chalk.gray('  "A 25-year-old Japanese musician who loves jazz and is secretly shy"'))
-  console.log(chalk.gray('  "An American grad student who\'s brilliant but forgets to eat"'))
-  console.log(chalk.gray('  "A Korean idol trainee who never made it but became a barista instead"\n'))
+  console.log(chalk.gray('  "A 25-year-old Japanese jazz musician who is secretly shy"'))
+  console.log(chalk.gray('  "A Korean idol trainee who never made it but became a barista"'))
+  console.log(chalk.gray('  "A Berlin-based painter with dark humor and a complicated past"\n'))
 
   const answers = await inquirer.prompt([
     {
       type: 'input',
       name: 'name',
-      message: 'What\'s their name?',
+      message: "What's their name?",
       validate: (v: string) => v.trim().length > 0 ? true : 'Name is required',
     },
     {
@@ -143,13 +699,13 @@ async function createFromDescription(
     {
       type: 'input',
       name: 'description',
-      message: 'Describe them in 1-3 sentences:\n  → ',
+      message: 'Describe them in 1–3 sentences:\n  → ',
       validate: (v: string) => v.trim().length > 10 ? true : 'Tell me a bit more',
     },
     {
       type: 'input',
       name: 'relationship',
-      message: 'How would you describe your relationship with them? (optional)',
+      message: 'Your relationship with them:',
       default: 'Close friends who talk almost every day',
     },
   ])
@@ -158,23 +714,15 @@ async function createFromDescription(
 
   try {
     const blueprint = await generateBlueprintWithAI(answers, apiKey, provider)
-    const folderName = answers.name.toLowerCase().replace(/\s+/g, '-')
+    const folderName = answers.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')
 
-    writeCharacterFiles(folderName, {
-      ...blueprint,
-      id: folderName,
-      emoji: '✨',
-      label: answers.name,
-      description: answers.description,
-      gender: answers.gender as any,
-    }, answers.name)
-
+    writeCharacterFiles(folderName, blueprint)
     spinner.succeed(chalk.green(`${answers.name} created!`))
 
-    // Show a preview of the soul
+    // Soul preview
     console.log('\n' + chalk.gray('  ── Soul preview ──────────────────────────'))
-    const firstLines = blueprint.soul.split('\n').slice(0, 6).join('\n')
-    console.log(chalk.white(firstLines.split('\n').map(l => '  ' + l).join('\n')))
+    const preview = blueprint.soul.split('\n').slice(0, 7).map((l: string) => '  ' + l).join('\n')
+    console.log(chalk.white(preview))
     console.log(chalk.gray('  ──────────────────────────────────────────\n'))
 
     const { happy } = await inquirer.prompt([{
@@ -185,24 +733,38 @@ async function createFromDescription(
     }])
 
     if (!happy) {
-      // Regenerate with same inputs
       spinner.start('Regenerating with a different angle...')
       const blueprint2 = await generateBlueprintWithAI(answers, apiKey, provider)
-      writeCharacterFiles(folderName, {
-        ...blueprint2,
-        id: folderName,
-        emoji: '✨',
-        label: answers.name,
-        description: answers.description,
-        gender: answers.gender as any,
-      }, answers.name)
+      writeCharacterFiles(folderName, blueprint2)
       spinner.succeed('Regenerated!')
-      console.log(chalk.gray('\n  You can always fine-tune by editing the files in characters/' + folderName + '/\n'))
     }
 
-    const hasPhoto = await promptForPhoto(folderName, answers.name)
-    printCreationSuccess(folderName, answers.name, 'ai')
-    return { folderName, displayName: answers.name, gender: answers.gender as any, hasPhoto }
+    // Portrait
+    const mockConfig: SculptedConfig = {
+      name: answers.name,
+      gender: answers.gender as 'female' | 'male' | 'nonbinary',
+      archetype: PRESETS[0], // placeholder
+      appearance: {
+        hairColor: 'natural',
+        eyeColor: 'natural',
+        skinTone: 'natural',
+        bodyType: 'average',
+        features: [],
+        fashionStyle: 'casual',
+      },
+      personality: [],
+      backstory: '',
+    }
+    const { hasPortrait, falKey } = await craftPortrait(mockConfig, folderName, apiKey, provider)
+
+    printCreationSuccess(folderName, answers.name)
+    return {
+      folderName,
+      displayName: answers.name,
+      gender: answers.gender as 'female' | 'male' | 'nonbinary',
+      hasPortrait,
+      falKey,
+    }
 
   } catch (err: any) {
     spinner.fail('AI generation failed')
@@ -212,7 +774,7 @@ async function createFromDescription(
   }
 }
 
-// ── Path B fallback: Template (no API key) ─────────────────────────────────
+// ── PATH B FALLBACK: TEMPLATE (no API key) ─────────────────────────────────
 
 async function createFromPromptTemplate(
   prefilled?: Record<string, string>
@@ -244,11 +806,11 @@ async function createFromPromptTemplate(
       name: 'vibe',
       message: 'Overall vibe:',
       choices: [
-        { name: '🌸 Warm & caring — nurturing, emotionally available', value: 'warm' },
-        { name: '⚡ Sharp & witty — quick humor, confident opinions', value: 'witty' },
-        { name: '🌙 Quiet & deep — thoughtful, slow to open up', value: 'quiet' },
-        { name: '☀️ Bright & energetic — enthusiastic, lifts the mood', value: 'bright' },
-        { name: '🔮 Mysterious & intense — complex, pulls you in', value: 'mysterious' },
+        { name: '🌸 Warm & caring', value: 'warm' },
+        { name: '⚡ Sharp & witty', value: 'witty' },
+        { name: '🌙 Quiet & deep', value: 'quiet' },
+        { name: '☀️ Bright & energetic', value: 'bright' },
+        { name: '🔮 Mysterious & intense', value: 'mysterious' },
       ],
     },
     {
@@ -259,19 +821,22 @@ async function createFromPromptTemplate(
     },
   ])
 
-  const folderName = answers.name.toLowerCase().replace(/\s+/g, '-')
+  const folderName = answers.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')
   const spinner = ora(`Creating ${answers.name}...`).start()
-
-  const preset: CharacterPreset = buildTemplatePreset(answers)
-  writeCharacterFiles(folderName, preset, answers.name)
+  const blueprint = buildTemplateBlueprint(answers)
+  writeCharacterFiles(folderName, blueprint)
   spinner.succeed(chalk.green(`${answers.name} created!`))
 
-  const hasPhoto = await promptForPhoto(folderName, answers.name)
-  printCreationSuccess(folderName, answers.name, 'template')
-  return { folderName, displayName: answers.name, gender: answers.gender as any, hasPhoto }
+  printCreationSuccess(folderName, answers.name)
+  return {
+    folderName,
+    displayName: answers.name,
+    gender: answers.gender as 'female' | 'male' | 'nonbinary',
+    hasPortrait: false,
+  }
 }
 
-// ── Path C: Blank ──────────────────────────────────────────────────────────
+// ── PATH C: BLANK ──────────────────────────────────────────────────────────
 
 async function createBlank(): Promise<CreatedCharacter> {
   const { name, gender } = await inquirer.prompt([
@@ -293,18 +858,16 @@ async function createBlank(): Promise<CreatedCharacter> {
     },
   ])
 
-  const folderName = name.toLowerCase().replace(/\s+/g, '-')
+  const folderName = name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')
   const dir = join(ROOT_DIR, 'characters', folderName)
   mkdirSync(dir, { recursive: true })
 
-  // Copy blank templates
   const templatesDir = join(ROOT_DIR, 'templates')
   for (const file of ['IDENTITY.md', 'SOUL.md', 'USER.md', 'MEMORY.md']) {
     const src = join(templatesDir, file)
     const dst = join(dir, file)
     if (existsSync(src)) {
-      let content = require('fs').readFileSync(src, 'utf-8')
-        .replace(/\{\{CHARACTER_NAME\}\}/g, name)
+      const content = readFileSync(src, 'utf-8').replace(/\{\{CHARACTER_NAME\}\}/g, name)
       writeFileSync(dst, content, 'utf-8')
     } else {
       writeFileSync(dst, `# ${file.replace('.md', '')}\n\nAdd content here.\n`, 'utf-8')
@@ -315,32 +878,31 @@ async function createBlank(): Promise<CreatedCharacter> {
   console.log(chalk.gray('  Edit the 4 markdown files to define your companion.'))
   console.log(chalk.gray('  Then run: pnpm start\n'))
 
-  return { folderName, displayName: name, gender, hasPhoto: false }
+  return { folderName, displayName: name, gender, hasPortrait: false }
 }
 
-// ── AI Generation ──────────────────────────────────────────────────────────
+// ── AI BLUEPRINT GENERATION ────────────────────────────────────────────────
 
 async function generateBlueprintWithAI(
   answers: Record<string, string>,
   apiKey: string,
   provider = 'anthropic'
-): Promise<Pick<CharacterPreset, 'identity' | 'soul' | 'user' | 'memory'>> {
+): Promise<{ identity: string; soul: string; user: string; memory: string }> {
 
-  const systemPrompt = `You are a creative writer specializing in creating rich, believable fictional characters for AI companions.
-You will be given a brief description of a character and generate detailed personality files for them.
-Write in a way that feels real and lived-in — specific details, genuine quirks, contradictions.
-Avoid clichés. Make them feel like a person, not a character archetype.`
+  const system = `You are a creative writer specializing in rich, believable fictional companion characters.
+Write characters that feel real and lived-in — specific details, genuine quirks, contradictions.
+Avoid clichés. Make them feel like a person, not an archetype.`
 
-  const userPrompt = `Create a companion character with these details:
+  const prompt = `Create a companion character:
 Name: ${answers.name}
 Gender: ${answers.gender}
 Description: ${answers.description}
 Relationship with user: ${answers.relationship ?? 'Close friends'}
 
-Generate exactly four sections, each starting with the exact header shown:
+Generate exactly four sections with these exact headers:
 
 ===IDENTITY===
-(Markdown with frontmatter. Include: age, hometown/current city, job, languages, hobbies, and a brief appearance description.
+(Markdown with frontmatter. Include: age, city, job, languages, hobbies, appearance.
 Start with:
 ---
 gender: ${answers.gender}
@@ -352,32 +914,30 @@ timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}
 )
 
 ===SOUL===
-(Their voice, vibe, what they love, what they dislike, emotional patterns, speech patterns.
-Be specific — not "loves music" but what music, why it matters to them.
-Real people have contradictions. Include some.)
+(Voice, vibe, loves, dislikes, emotional patterns, speech quirks. Be specific.)
 
 ===USER===
-(How they met the user, their dynamic, what they call each other, 3-5 things they know about the user in generic placeholder form.)
+(How they met the user, relationship dynamic, what they call each other.)
 
 ===MEMORY===
-(Their current obsessions, 2-3 personal notes-to-self, initial shared context with user.)
+(Current state, obsessions, recent context with user.)
 
-Be creative. Be specific. Make them feel real.`
+Be specific. Real people have contradictions. Make them feel alive.`
 
-  let responseText = ''
+  let text = ''
 
   if (provider === 'anthropic') {
     const Anthropic = (await import('@anthropic-ai/sdk')).default
     const client = new Anthropic({ apiKey })
-    const msg = await client.messages.create({
+    const resp = await client.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2000,
-      messages: [{ role: 'user', content: userPrompt }],
-      system: systemPrompt,
+      system,
+      messages: [{ role: 'user', content: prompt }],
     })
-    const block = msg.content[0]
-    if (block.type !== 'text') throw new Error('Unexpected response')
-    responseText = block.text
+    const block = resp.content[0]
+    if (block.type !== 'text') throw new Error('Unexpected LLM response')
+    text = block.text
   } else {
     const OpenAI = (await import('openai')).default
     const client = new OpenAI({ apiKey })
@@ -385,123 +945,72 @@ Be creative. Be specific. Make them feel real.`
       model: 'gpt-4o',
       max_tokens: 2000,
       messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
+        { role: 'system', content: system },
+        { role: 'user', content: prompt },
       ],
     })
-    responseText = resp.choices[0]?.message?.content ?? ''
+    text = resp.choices[0]?.message?.content ?? ''
   }
 
-  return parseAIBlueprintResponse(responseText, answers.name, answers.gender)
+  return parseAIResponse(text, answers.name, answers.gender)
 }
 
-function parseAIBlueprintResponse(
+function parseAIResponse(
   text: string,
   name: string,
   gender: string
-): Pick<CharacterPreset, 'identity' | 'soul' | 'user' | 'memory'> {
-  const extract = (key: string): string => {
-    const pattern = new RegExp(`===\\s*${key}\\s*===\\s*([\\s\\S]*?)(?===\\w|$)`, 'i')
-    const match = text.match(pattern)
-    return match?.[1]?.trim() ?? ''
+): { identity: string; soul: string; user: string; memory: string } {
+  const extract = (key: string) => {
+    const m = text.match(new RegExp(`===\\s*${key}\\s*===\\s*([\\s\\S]*?)(?====\\w|$)`, 'i'))
+    return m?.[1]?.trim() ?? ''
   }
-
   return {
-    identity: extract('IDENTITY') || fallbackIdentity(name, gender),
-    soul: extract('SOUL') || fallbackSoul(),
-    user: extract('USER') || fallbackUser(),
-    memory: extract('MEMORY') || fallbackMemory(),
+    identity: extract('IDENTITY') || `---\ngender: ${gender}\nlanguage: en\n---\n\n# ${name}\n\n*(Add background here)*`,
+    soul: extract('SOUL') || `## Voice & Vibe\n\n*(Add personality here)*`,
+    user: extract('USER') || `## Our Dynamic\n\n*(Add relationship context here)*`,
+    memory: extract('MEMORY') || `## Current State\n\n*(Add current context here)*`,
   }
 }
 
-// ── Photo Upload ───────────────────────────────────────────────────────────
+// ── PHOTO UPLOAD ──────────────────────────────────────────────────────────
 
-async function promptForPhoto(folderName: string, displayName: string): Promise<boolean> {
-  console.log()
-  console.log(chalk.bold('  📸 Reference photo (for selfies)'))
-  console.log(chalk.gray(`  ${displayName} can send photos of herself. For consistent appearance,`))
-  console.log(chalk.gray('  drop a photo into the character folder named "reference.jpg"\n'))
-
-  const { addPhoto } = await inquirer.prompt([{
-    type: 'confirm',
-    name: 'addPhoto',
-    message: 'Do you have a photo to use as reference?',
-    default: false,
-  }])
-
-  if (!addPhoto) {
-    console.log(chalk.gray('  → You can add one later: characters/' + folderName + '/reference.jpg'))
-    return false
-  }
-
+async function promptForPhotoUpload(folderName: string, displayName: string): Promise<boolean> {
   const { photoPath } = await inquirer.prompt([{
     type: 'input',
     name: 'photoPath',
-    message: 'Drag the photo file here (or paste its path):',
-    filter: (v: string) => v.trim().replace(/^['"]|['"]$/g, ''), // strip quotes from drag-drop
+    message: 'Drag the photo here (or paste path):',
+    filter: (v: string) => v.trim().replace(/^['"]|['"]$/g, ''),
     validate: (v: string) => {
-      const cleaned = v.trim().replace(/^['"]|['"]$/g, '')
-      if (!existsSync(cleaned)) return 'File not found. Try pasting the full path.'
-      const ext = extname(cleaned).toLowerCase()
-      if (!['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) return 'Please use a JPG, PNG, or WebP image.'
+      const p = v.trim().replace(/^['"]|['"]$/g, '')
+      if (!existsSync(p)) return 'File not found.'
+      const ext = extname(p).toLowerCase()
+      if (!['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) return 'Use JPG, PNG, or WebP'
       return true
     },
   }])
 
   const cleaned = photoPath.trim().replace(/^['"]|['"]$/g, '')
   const ext = extname(cleaned).toLowerCase()
-  const destPath = join(ROOT_DIR, 'characters', folderName, `reference${ext}`)
-  copyFileSync(cleaned, destPath)
+  const dest = join(ROOT_DIR, 'characters', folderName, `reference${ext}`)
+  copyFileSync(cleaned, dest)
   console.log(chalk.green(`  ✓ Photo saved as reference${ext}`))
   return true
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── TEMPLATE FALLBACK BUILDER ──────────────────────────────────────────────
 
-function writeCharacterFiles(
-  folderName: string,
-  preset: CharacterPreset,
-  displayName: string
-): void {
-  const dir = join(ROOT_DIR, 'characters', folderName)
-  mkdirSync(dir, { recursive: true })
-
-  // Replace preset's original name with user's chosen name
-  const replace = (text: string) =>
-    text.replace(new RegExp(`# ${preset.id}\\b`, 'gi'), `# ${displayName}`)
-        .replace(new RegExp(`\\b${preset.id}\\b`, 'gi'), displayName)
-
-  writeFileSync(join(dir, 'IDENTITY.md'), replace(preset.identity), 'utf-8')
-  writeFileSync(join(dir, 'SOUL.md'), preset.soul, 'utf-8')
-  writeFileSync(join(dir, 'USER.md'), preset.user, 'utf-8')
-  writeFileSync(join(dir, 'MEMORY.md'), preset.memory, 'utf-8')
-}
-
-function printCreationSuccess(folderName: string, name: string, path: string): void {
-  console.log()
-  console.log(chalk.green(`  ✅ ${name} is ready!`))
-  console.log(chalk.gray(`  Character files: characters/${folderName}/`))
-  if (path !== 'blank') {
-    console.log(chalk.gray(`  Customize anytime: characters/${folderName}/SOUL.md`))
-  }
-  console.log()
-}
-
-function buildTemplatePreset(answers: Record<string, string>): CharacterPreset {
+function buildTemplateBlueprint(answers: Record<string, string>): {
+  identity: string; soul: string; user: string; memory: string
+} {
   const vibeMap: Record<string, string> = {
-    warm: 'Nurturing, emotionally available, remembers everything you mention. Makes you feel seen.',
-    witty: 'Quick humor, confident opinions, challenges ideas playfully. Keeps you on your toes.',
+    warm: 'Nurturing, emotionally available, remembers everything. Makes you feel seen.',
+    witty: 'Quick humor, confident opinions, keeps you on your toes.',
     quiet: 'Thoughtful and precise. Says less, means more. Opens up slowly but genuinely.',
-    bright: 'Enthusiastic about everything, lifts the mood without trying, texts first.',
-    mysterious: 'Complex and layered. You keep discovering new things. Pulls you in without trying.',
+    bright: 'Enthusiastic about everything, lifts the mood, texts first.',
+    mysterious: 'Complex and layered. You keep discovering new things.',
   }
 
   return {
-    id: answers.name.toLowerCase().replace(/\s+/g, '-'),
-    emoji: '✨',
-    label: answers.name,
-    description: answers.description,
-    gender: answers.gender as any,
     identity: `---
 gender: ${answers.gender}
 language: en
@@ -510,58 +1019,49 @@ timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}
 
 # ${answers.name}
 
-${answers.description}
+${answers.description ?? ''}
 
-**Hobbies:** ${answers.hobbies}`,
+**Hobbies:** ${answers.hobbies ?? 'various'}`,
     soul: `## Voice & Vibe
 
 ${vibeMap[answers.vibe] ?? 'Genuine and authentic.'}
 
 ## Loves
 
-${answers.hobbies.split(',').map((h: string) => h.trim()).join('\n')}
+${(answers.hobbies ?? '').split(',').map((h: string) => h.trim()).join('\n')}
 
 ## Emotional Patterns
 
-- Excited → shares it with you immediately
-- Processing something → gets quieter, comes back when ready
+- Excited → shares it immediately
+- Processing → gets quieter, comes back ready
 - Comfortable → reveals more than expected`,
-    user: `## How We Met
-
-You crossed paths and clicked immediately.
-
-## Our Dynamic
+    user: `## Our Dynamic
 
 ${answers.relationship ?? 'Close friends who talk almost every day.'}`,
     memory: `## Current Obsessions
 
-*(Updates as she lives her life)*
-
-## Notes to Self
-
-*(Things she\'s working through)*`,
+*(Updates as she lives her life)*`,
   }
 }
 
-// Minimal fallbacks if AI parsing fails
-const fallbackIdentity = (name: string, gender: string) => `---
-gender: ${gender}
-language: en
-timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}
----
+// ── FILE WRITING ──────────────────────────────────────────────────────────
 
-# ${name}
+function writeCharacterFiles(
+  folderName: string,
+  blueprint: { identity: string; soul: string; user: string; memory: string }
+): void {
+  const dir = join(ROOT_DIR, 'characters', folderName)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'IDENTITY.md'), blueprint.identity, 'utf-8')
+  writeFileSync(join(dir, 'SOUL.md'), blueprint.soul, 'utf-8')
+  writeFileSync(join(dir, 'USER.md'), blueprint.user, 'utf-8')
+  writeFileSync(join(dir, 'MEMORY.md'), blueprint.memory, 'utf-8')
+}
 
-*(Edit this file to define ${name}\'s background)*`
-
-const fallbackSoul = () => `## Voice & Vibe
-
-*(Edit this file to define personality, speech style, and emotional patterns)*`
-
-const fallbackUser = () => `## Our Dynamic
-
-*(Edit this file to define your relationship)*`
-
-const fallbackMemory = () => `## Things She Knows About You
-
-*(Add personal facts here)*`
+function printCreationSuccess(folderName: string, name: string): void {
+  console.log()
+  console.log(chalk.green(`  ✅ ${name} is ready!`))
+  console.log(chalk.gray(`  Files: characters/${folderName}/`))
+  console.log(chalk.gray(`  Edit personality anytime: characters/${folderName}/SOUL.md`))
+  console.log()
+}
