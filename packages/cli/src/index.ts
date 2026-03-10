@@ -43,9 +43,10 @@ async function main(): Promise<void> {
 
     case 'create':
     case 'create-character': {
-      const { runSetupWizard } = await import('./setup.js')
-      // Run only the character creation part (handled by setup when no .env exists)
-      await runSetupWizard()
+      const { createCharacterFlow } = await import('./create.js')
+      const result = await createCharacterFlow()
+      console.log(chalk.green(`\n  ✅ Character "${result.folderName}" created!`))
+      console.log(chalk.gray(`  Files: characters/${result.folderName}/\n`))
       break
     }
 

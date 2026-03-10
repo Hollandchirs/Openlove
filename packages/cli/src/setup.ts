@@ -14,8 +14,10 @@ import inquirer from 'inquirer'
 import chalk from 'chalk'
 import ora from 'ora'
 import boxen from 'boxen'
-import { writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync } from 'fs'
+import { writeFileSync, existsSync, readdirSync } from 'fs'
 import { join } from 'path'
+import { createCharacterFlow } from './create.js'
+import { runTestChat } from './test-chat.js'
 
 const ROOT_DIR = process.cwd()
 
@@ -101,7 +103,6 @@ export async function runSetupWizard(): Promise<void> {
   console.log(chalk.bold('\n\n💝 Step 2: Your companion\n'))
 
   const characters = getExistingCharacters()
-
   let characterName: string
 
   if (characters.length > 0) {
@@ -114,10 +115,23 @@ export async function runSetupWizard(): Promise<void> {
         { name: '➕ Create a new companion', value: '__new__' },
       ],
     }])
-    characterName = characterChoice === '__new__' ? await createNewCharacter() : characterChoice
+
+    if (characterChoice === '__new__') {
+      const apiKey = envValues.ANTHROPIC_API_KEY ?? envValues.OPENAI_API_KEY
+      const provider = envValues.ANTHROPIC_API_KEY ? 'anthropic' : 'openai'
+      const created = await createCharacterFlow(apiKey, provider)
+      characterName = created.folderName
+      await runTestChat(characterName, apiKey, provider)
+    } else {
+      characterName = characterChoice
+    }
   } else {
-    console.log(chalk.gray('No companions yet — let\'s create one!\n'))
-    characterName = await createNewCharacter()
+    console.log(chalk.gray('  No companions yet — let\'s create one!\n'))
+    const apiKey = envValues.ANTHROPIC_API_KEY ?? envValues.OPENAI_API_KEY
+    const provider = envValues.ANTHROPIC_API_KEY ? 'anthropic' : 'openai'
+    const created = await createCharacterFlow(apiKey, provider)
+    characterName = created.folderName
+    await runTestChat(characterName, apiKey, provider)
   }
 
   envValues.CHARACTER_NAME = characterName
@@ -277,166 +291,6 @@ export async function runSetupWizard(): Promise<void> {
     chalk.gray('Need help? https://github.com/Hollandchirs/Openlove'),
     { padding: 1, margin: 1, borderStyle: 'round', borderColor: 'magenta' }
   ))
-}
-
-async function createNewCharacter(): Promise<string> {
-  console.log(chalk.cyan('\nLet\'s create your companion. Answer a few questions and AI will do the rest!\n'))
-
-  const answers = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'name',
-      message: 'What\'s her/his name?',
-      validate: (v: string) => v.trim().length > 0 ? true : 'Name required',
-    },
-    {
-      type: 'list',
-      name: 'gender',
-      message: 'Gender:',
-      choices: [
-        { name: '👩 Female', value: 'female' },
-        { name: '👨 Male', value: 'male' },
-        { name: '🌈 Non-binary', value: 'nonbinary' },
-      ],
-    },
-    {
-      type: 'input',
-      name: 'age',
-      message: 'Age?',
-      default: '22',
-    },
-    {
-      type: 'input',
-      name: 'from',
-      message: 'Where are they from?',
-      default: 'Seoul, South Korea',
-    },
-    {
-      type: 'list',
-      name: 'mbti',
-      message: 'Pick a personality type (MBTI):',
-      choices: [
-        { name: 'INFJ — Gentle, deep, intuitive. Rare and intense.', value: 'INFJ' },
-        { name: 'ENFP — Bubbly, creative, always excited about something.', value: 'ENFP' },
-        { name: 'ISFP — Chill, artistic, lives in the moment.', value: 'ISFP' },
-        { name: 'ENTJ — Confident, driven, a little intimidating.', value: 'ENTJ' },
-        { name: 'INTP — Nerdy, thoughtful, secretly warm.', value: 'INTP' },
-        { name: 'ESFP — Fun, spontaneous, loves being the center of attention.', value: 'ESFP' },
-        { name: 'ISTJ — Reliable, earnest, shows love through actions.', value: 'ISTJ' },
-        { name: 'ENTP — Witty, loves to debate, can\'t stop talking.', value: 'ENTP' },
-      ],
-    },
-    {
-      type: 'input',
-      name: 'hobbies',
-      message: 'What does she/he love? (separate with commas)',
-      default: 'K-dramas, lo-fi music, coffee shops, sketching',
-    },
-    {
-      type: 'input',
-      name: 'relationship',
-      message: 'How would you describe your relationship?',
-      default: 'Best friends who care deeply about each other',
-    },
-  ])
-
-  const characterName = answers.name.toLowerCase().replace(/\s+/g, '-')
-  const spinner = ora(`Creating ${answers.name}...`).start()
-
-  await generateBlueprintFiles(characterName, answers)
-
-  spinner.succeed(`${answers.name} created!`)
-  console.log(chalk.gray(`\n  Her files are in: characters/${characterName}/`))
-  console.log(chalk.gray('  You can edit them anytime to customize her personality.\n'))
-
-  return characterName
-}
-
-async function generateBlueprintFiles(
-  characterName: string,
-  answers: Record<string, string>
-): Promise<void> {
-  const dir = join(ROOT_DIR, 'characters', characterName)
-  mkdirSync(dir, { recursive: true })
-
-  const identity = `---
-gender: ${answers.gender}
-language: en
-timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}
----
-
-# ${answers.name}
-
-- **Age:** ${answers.age}
-- **From:** ${answers.from}
-- **Personality:** ${answers.mbti}
-- **Hobbies:** ${answers.hobbies}
-`
-
-  const soul = `## Voice & Vibe
-
-${getMbtiVoice(answers.mbti)}
-
-## Loves
-${answers.hobbies}
-
-## Emotional Patterns
-- Gets excited and texts immediately when something good happens
-- Goes quiet and needs space when overwhelmed
-- Shows care through small gestures and remembering details
-
-## Speech Style
-Conversational, warm, occasionally uses lowercase for emphasis. Not overly formal.
-Sends voice notes or selfies when excited about something.
-`
-
-  const user = `## How We Met
-We've known each other for a while now. There's a comfortable ease between us.
-
-## Our Dynamic
-${answers.relationship}
-
-## What They Know About Me
-*(Add personal details here — she'll remember them)*
-
-## Our Inside Jokes & Traditions
-*(Add things that are just yours)*
-`
-
-  const memory = `## Things She Knows About You
-*(Add facts about yourself so she can reference them naturally)*
-- Example: Your favorite food is pizza
-- Example: You're a night owl
-- Example: You're learning to play guitar
-
-## Shared Experiences
-*(Events you've "experienced" together)*
-- She recommended you watch [show name]
-- You both talked about [topic] once
-
-## Current Obsessions
-She's currently watching: *to be discovered*
-She's been listening to: *lo-fi beats, indie pop*
-`
-
-  writeFileSync(join(dir, 'IDENTITY.md'), identity, 'utf-8')
-  writeFileSync(join(dir, 'SOUL.md'), soul, 'utf-8')
-  writeFileSync(join(dir, 'USER.md'), user, 'utf-8')
-  writeFileSync(join(dir, 'MEMORY.md'), memory, 'utf-8')
-}
-
-function getMbtiVoice(mbti: string): string {
-  const voices: Record<string, string> = {
-    INFJ: 'Thoughtful and measured. Speaks with depth. Chooses words carefully. Warm but private.',
-    ENFP: 'Enthusiastic, lots of exclamation points, jumps between topics, genuinely excited about everything.',
-    ISFP: 'Laid-back, artistic references, goes with the flow, expresses feelings through aesthetics.',
-    ENTJ: 'Direct, confident, has opinions on everything, secretly cares deeply about people close to her.',
-    INTP: 'Overthinks texts, sends long thoughtful messages, occasional deadpan humor, gets excited about niche topics.',
-    ESFP: 'Chaotic, fun, uses caps for emphasis, sends voice notes constantly, loves sharing experiences.',
-    ISTJ: 'Dependable, practical, shows love through remembering details and following through on things.',
-    ENTP: 'Playful, challenges ideas, loves "but what if" conversations, clever and a little chaotic.',
-  }
-  return voices[mbti] ?? 'Warm, genuine, and authentic in all interactions.'
 }
 
 function getExistingCharacters(): string[] {

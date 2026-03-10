@@ -5,4 +5,6 @@ export default defineConfig({
   format: ['cjs'],
   outExtension: () => ({ js: '.js' }),
   clean: true,
+  // openai is optional — only needed if user picks OpenAI provider
+  external: ['openai'],
 })
