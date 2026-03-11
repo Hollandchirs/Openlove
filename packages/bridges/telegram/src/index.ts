@@ -126,7 +126,8 @@ export class TelegramBridge {
           await ctx.replyWithChatAction('upload_photo')
           const imageBuffer = await this.config.media.generateImage(
             action.prompt,
-            this.config.engine.characterBlueprint.referenceImagePath
+            this.config.engine.characterBlueprint.referenceImagePath,
+            action.style
           )
           if (imageBuffer) {
             await ctx.replyWithPhoto(new InputFile(imageBuffer, 'photo.jpg'))
@@ -168,7 +169,8 @@ export class TelegramBridge {
         if (action.type === 'send_image') {
           const imageBuffer = await this.config.media.generateImage(
             action.prompt,
-            this.config.engine.characterBlueprint.referenceImagePath
+            this.config.engine.characterBlueprint.referenceImagePath,
+            action.style
           )
           if (imageBuffer) {
             await this.bot.api.sendPhoto(this.config.ownerId, new InputFile(imageBuffer, 'photo.jpg'))

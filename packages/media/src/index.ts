@@ -29,17 +29,17 @@ export class MediaEngine {
     this.videoEngine = new VideoEngine(config.video)
   }
 
-  async generateImage(prompt: string, referenceImagePath?: string): Promise<Buffer | null> {
-    // Randomly pick style and aspect ratio to simulate natural phone usage
+  async generateImage(prompt: string, referenceImagePath?: string, style?: 'casual' | 'mirror' | 'close-up' | 'location'): Promise<Buffer | null> {
+    // Use provided style or pick random
     const styles: Array<'casual' | 'mirror' | 'close-up' | 'location'> = ['casual', 'mirror', 'close-up', 'location']
-    const style = styles[Math.floor(Math.random() * styles.length)]
+    const pickedStyle = style ?? styles[Math.floor(Math.random() * styles.length)]
     // 70% chance 4:5 (portrait), 30% chance 9:16 (full body vertical)
     const aspectRatio: '4:5' | '9:16' = Math.random() < 0.7 ? '4:5' : '9:16'
 
     return this.imageEngine.generateSelfie({
       prompt,
       referenceImagePath,
-      style,
+      style: pickedStyle,
       aspectRatio,
     })
   }

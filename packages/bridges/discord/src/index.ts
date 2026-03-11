@@ -463,7 +463,8 @@ export class DiscordBridge {
         if (action.type === 'send_image') {
           const imageBuffer = await this.config.media.generateImage(
             action.prompt,
-            this.config.engine.characterBlueprint.referenceImagePath
+            this.config.engine.characterBlueprint.referenceImagePath,
+            action.style
           )
           if (imageBuffer) {
             const attachment = new AttachmentBuilder(imageBuffer, { name: 'photo.jpg' })

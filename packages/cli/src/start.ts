@@ -15,7 +15,7 @@ dotenv.config({ path: resolve(process.env.INIT_CWD ?? process.cwd(), '.env') })
 import chalk from 'chalk'
 import { ConversationEngine } from '@openlove/core'
 import { MediaEngine } from '@openlove/media'
-import { AutonomousScheduler, MusicEngine, DramaEngine } from '@openlove/autonomous'
+import { AutonomousScheduler, MusicEngine, DramaEngine, ActivityManager, BrowserAgent } from '@openlove/autonomous'
 import { join } from 'path'
 
 const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
@@ -73,8 +73,17 @@ export async function startOpenlove(): Promise<void> {
 
   console.log(chalk.green(`  ✓ Media engine ready`))
 
+  // ── Initialize activity manager ────────────────────────────────────────
+  const activityManager = new ActivityManager()
+
+  // Browser agent (optional — requires Playwright)
+  let browserAgent: BrowserAgent | undefined
+  if (config.BROWSER_AUTOMATION_ENABLED !== 'false') {
+    browserAgent = new BrowserAgent()
+  }
+
   // ── Start bridges ───────────────────────────────────────────────────────
-  const bridges: Array<{ sendProactiveMessage: (r: any) => Promise<void>; stop: () => Promise<void> }> = []
+  const bridges: Array<{ sendProactiveMessage: (r: any) => Promise<void>; stop: () => Promise<void>; updatePresence?: (a: any) => void }> = []
 
   if (config.DISCORD_BOT_TOKEN) {
     const { DiscordBridge } = await import('@openlove/bridge-discord')
@@ -84,9 +93,16 @@ export async function startOpenlove(): Promise<void> {
       ownerId: config.DISCORD_OWNER_ID ?? '',
       engine,
       media,
+      voiceConversationEnabled: config.VOICE_CONVERSATION_ENABLED !== 'false',
     })
     await discord.start()
     bridges.push(discord)
+
+    // Wire activity changes to Discord Rich Presence
+    activityManager.setCallback((activity) => {
+      discord.updatePresence(activity)
+    })
+
     console.log(chalk.green(`  ✓ Discord bridge connected`))
   }
 
@@ -137,6 +153,8 @@ export async function startOpenlove(): Promise<void> {
     engine,
     music: musicEngine,
     drama: dramaEngine,
+    activityManager,
+    browserAgent,
     quietHoursStart: parseInt(config.QUIET_HOURS_START ?? '23'),
     quietHoursEnd: parseInt(config.QUIET_HOURS_END ?? '8'),
     minIntervalMinutes: parseInt(config.PROACTIVE_MESSAGE_MIN_INTERVAL ?? '60'),
@@ -148,7 +166,7 @@ export async function startOpenlove(): Promise<void> {
     },
   })
 
-  scheduler.start()
+  await scheduler.start()
   console.log(chalk.green(`  ✓ Autonomous scheduler running`))
 
   // ── Ready ───────────────────────────────────────────────────────────────
@@ -207,6 +225,8 @@ function loadConfig(): Record<string, string | undefined> {
     QUIET_HOURS_END: process.env.QUIET_HOURS_END,
     PROACTIVE_MESSAGE_MIN_INTERVAL: process.env.PROACTIVE_MESSAGE_MIN_INTERVAL,
     PROACTIVE_MESSAGE_MAX_INTERVAL: process.env.PROACTIVE_MESSAGE_MAX_INTERVAL,
+    VOICE_CONVERSATION_ENABLED: process.env.VOICE_CONVERSATION_ENABLED,
+    BROWSER_AUTOMATION_ENABLED: process.env.BROWSER_AUTOMATION_ENABLED,
   }
 }
 

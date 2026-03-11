@@ -4,11 +4,11 @@
  * Manages the character's "life" — when she listens to music,
  * watches dramas, browses the web, and proactively reaches out.
  *
- * Activities update Discord Rich Presence in real time and can
- * optionally open real browser windows via Playwright.
+ * Uses a daily routine system with randomized intervals to simulate
+ * natural human-like behavior. Activities update Discord Rich Presence
+ * in real time and can optionally open real browser windows via Playwright.
  *
  * All timings respect quiet hours (don't disturb while user sleeps).
- * Runs as a set of cron jobs alongside the main bridge process.
  */
 
 import * as cron from 'node-cron'
@@ -36,6 +36,8 @@ export class AutonomousScheduler {
   private config: SchedulerConfig
   private lastProactiveMessage: number = 0
   private jobs: cron.ScheduledTask[] = []
+  private activityLoopTimer?: NodeJS.Timeout
+  private running = false
 
   constructor(config: SchedulerConfig) {
     this.config = config
@@ -43,6 +45,7 @@ export class AutonomousScheduler {
 
   async start(): Promise<void> {
     console.log('[Autonomous] Scheduler starting...')
+    this.running = true
 
     // Launch browser if available
     if (this.config.browserAgent) {
@@ -59,38 +62,6 @@ export class AutonomousScheduler {
       cron.schedule('30 8 * * *', () => this.morningGreeting())
     )
 
-    // Music listening — twice a day (lunch & evening)
-    this.jobs.push(
-      cron.schedule('0 12 * * *', () => this.listenToMusic())
-    )
-    this.jobs.push(
-      cron.schedule('0 20 * * *', () => this.listenToMusic())
-    )
-
-    // Drama watching — evening (9 PM)
-    this.jobs.push(
-      cron.schedule('0 21 * * *', () => this.watchDrama())
-    )
-
-    // Random YouTube browsing — mid-morning and afternoon
-    this.jobs.push(
-      cron.schedule('30 10 * * *', () => this.browseYouTube())
-    )
-    this.jobs.push(
-      cron.schedule('30 15 * * *', () => this.browseYouTube())
-    )
-
-    // Random web browsing — a few times a day
-    this.jobs.push(
-      cron.schedule('0 11 * * *', () => this.browseRandom())
-    )
-    this.jobs.push(
-      cron.schedule('0 14 * * *', () => this.browseRandom())
-    )
-    this.jobs.push(
-      cron.schedule('0 17 * * *', () => this.browseRandom())
-    )
-
     // Random thoughts throughout the day — every 2 hours during active hours
     this.jobs.push(
       cron.schedule('0 */2 9-22 * * *', () => this.maybeRandomThought())
@@ -101,14 +72,24 @@ export class AutonomousScheduler {
       cron.schedule('*/30 * * * *', () => this.checkMissingUser())
     )
 
+    // Start the autonomous activity loop — picks activities based on daily routine
+    this.startActivityLoop()
+
     console.log('[Autonomous] Scheduler started. She has a life now ✨')
   }
 
   async stop(): Promise<void> {
+    this.running = false
+
     for (const job of this.jobs) {
       job.stop()
     }
     this.jobs = []
+
+    if (this.activityLoopTimer) {
+      clearTimeout(this.activityLoopTimer)
+      this.activityLoopTimer = undefined
+    }
 
     // Close browser
     if (this.config.browserAgent) {
@@ -118,13 +99,82 @@ export class AutonomousScheduler {
     console.log('[Autonomous] Scheduler stopped')
   }
 
+  // ── Autonomous Activity Loop ─────────────────────────────────────────
+
+  /**
+   * Continuously pick and execute activities based on the daily routine.
+   * Uses randomized intervals (20-60 min) between activities to feel natural.
+   */
+  private startActivityLoop(): void {
+    if (!this.running) return
+
+    const doNext = async () => {
+      if (!this.running) return
+      if (this.isQuietHours()) {
+        // During quiet hours, just idle and check again in 30 min
+        this.scheduleNextActivity(30 * 60 * 1000)
+        return
+      }
+
+      await this.performRoutineActivity()
+
+      // Random interval until next activity: 20-60 minutes
+      const minMs = 20 * 60 * 1000
+      const maxMs = 60 * 60 * 1000
+      const nextInterval = minMs + Math.random() * (maxMs - minMs)
+      this.scheduleNextActivity(nextInterval)
+    }
+
+    // First activity after a short delay (2-5 min after boot)
+    const bootDelay = (2 + Math.random() * 3) * 60 * 1000
+    this.activityLoopTimer = setTimeout(doNext, bootDelay)
+  }
+
+  private scheduleNextActivity(delayMs: number): void {
+    if (!this.running) return
+    this.activityLoopTimer = setTimeout(() => {
+      if (!this.running) return
+      this.startActivityLoop()
+    }, delayMs)
+  }
+
+  /**
+   * Pick and execute an activity based on the current time slot in the daily routine.
+   */
+  private async performRoutineActivity(): Promise<void> {
+    const activityType = this.config.activityManager.pickNextActivityType()
+    if (!activityType) return
+
+    try {
+      switch (activityType) {
+        case 'music':
+          await this.listenToMusic()
+          break
+        case 'drama':
+          await this.watchDrama()
+          break
+        case 'youtube':
+          await this.browseYouTube()
+          break
+        case 'browse':
+          await this.browseRandom()
+          break
+        default:
+          console.log(`[Autonomous] Unknown activity type: ${activityType}`)
+      }
+    } catch (err) {
+      console.error(`[Autonomous] Activity error (${activityType}):`, err)
+    }
+  }
+
+  // ── Individual Activities ────────────────────────────────────────────
+
   private isQuietHours(): boolean {
     const hour = new Date().getHours()
     const start = this.config.quietHoursStart ?? 23
     const end = this.config.quietHoursEnd ?? 8
 
     if (start > end) {
-      // E.g., quiet from 23 to 8 (overnight)
       return hour >= start || hour < end
     }
     return hour >= start && hour < end
@@ -162,7 +212,9 @@ export class AutonomousScheduler {
     try {
       const track = await this.config.music.listenToSomething()
 
-      // Update presence — "Listening to X by Y"
+      // Randomized duration: 2-5 minutes
+      const durationMs = (2 + Math.random() * 3) * 60 * 1000
+
       this.config.activityManager.startActivity(
         {
           type: 'listening',
@@ -170,7 +222,7 @@ export class AutonomousScheduler {
           artist: track.artist,
           album: track.album,
         },
-        3 * 60 * 1000 // 3 minutes
+        durationMs
       )
 
       // Open Spotify in real browser if available
@@ -187,8 +239,8 @@ export class AutonomousScheduler {
         timestamp: Date.now(),
       })
 
-      // 60% chance she shares it with you
-      if (Math.random() < 0.6) {
+      // 40% chance she shares it with you
+      if (Math.random() < 0.4) {
         await this.sendIfAppropriate({
           type: 'music',
           data: { track: track.track, artist: track.artist },
@@ -203,14 +255,16 @@ export class AutonomousScheduler {
     try {
       const episode = await this.config.drama.watchNextEpisode()
 
-      // Update presence — "Watching X"
+      // Randomized duration: 20-40 minutes
+      const durationMs = (20 + Math.random() * 20) * 60 * 1000
+
       this.config.activityManager.startActivity(
         {
           type: 'watching',
           title: episode.showName,
           details: `S${episode.season}E${episode.episode}`,
         },
-        25 * 60 * 1000 // 25 minutes
+        durationMs
       )
 
       // Open YouTube to "watch" in real browser if available
@@ -235,8 +289,8 @@ export class AutonomousScheduler {
         timestamp: Date.now(),
       })
 
-      // 70% chance she reaches out to talk about it
-      if (Math.random() < 0.7) {
+      // 50% chance she reaches out to talk about it
+      if (Math.random() < 0.5) {
         await this.sendIfAppropriate({
           type: 'drama',
           data: {
@@ -251,9 +305,6 @@ export class AutonomousScheduler {
     }
   }
 
-  /**
-   * Browse YouTube for something related to the character's interests.
-   */
   private async browseYouTube(): Promise<void> {
     if (this.isQuietHours()) return
 
@@ -265,18 +316,18 @@ export class AutonomousScheduler {
     ]
     const topic = topics[Math.floor(Math.random() * topics.length)]
 
-    // Update presence
+    // Randomized duration: 5-15 minutes
+    const durationMs = (5 + Math.random() * 10) * 60 * 1000
+
     this.config.activityManager.startActivity(
       { type: 'browsing', title: `YouTube: ${topic}` },
-      10 * 60 * 1000 // 10 minutes
+      durationMs
     )
 
-    // Open in real browser if available
     if (this.config.browserAgent?.isAvailable()) {
       await this.config.browserAgent.watchYouTube(topic)
     }
 
-    // Log to memory
     await this.config.engine.getMemory().logEpisode({
       type: 'event',
       title: `Watched YouTube videos about ${topic}`,
@@ -287,9 +338,6 @@ export class AutonomousScheduler {
     console.log(`[Autonomous] Browsing YouTube: ${topic}`)
   }
 
-  /**
-   * Browse random websites — simulate scrolling social media, reading articles, etc.
-   */
   private async browseRandom(): Promise<void> {
     if (this.isQuietHours()) return
 
@@ -303,18 +351,18 @@ export class AutonomousScheduler {
     ]
     const activity = activities[Math.floor(Math.random() * activities.length)]
 
-    // Update presence
+    // Randomized duration: 5-12 minutes
+    const durationMs = (5 + Math.random() * 7) * 60 * 1000
+
     this.config.activityManager.startActivity(
       { type: 'browsing', title: activity.title },
-      8 * 60 * 1000 // 8 minutes
+      durationMs
     )
 
-    // Open in real browser if available
     if (this.config.browserAgent?.isAvailable()) {
       await this.config.browserAgent.browseRandom()
     }
 
-    // Log to memory
     await this.config.engine.getMemory().logEpisode({
       type: 'event',
       title: `Was ${activity.title}`,
@@ -326,9 +374,15 @@ export class AutonomousScheduler {
   }
 
   private async maybeRandomThought(): Promise<void> {
-    // Only about 20% chance each check — keeps it from being too frequent
     if (Math.random() > 0.2) return
-    await this.sendIfAppropriate({ type: 'random_thought' })
+
+    // Inject recent activity context so the LLM knows what she's been doing
+    const recentActivity = this.config.activityManager.getRecentActivitySummary()
+
+    await this.sendIfAppropriate({
+      type: 'random_thought',
+      data: { recentActivity },
+    })
   }
 
   private async checkMissingUser(): Promise<void> {
