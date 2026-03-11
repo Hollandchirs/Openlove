@@ -30,10 +30,17 @@ export class MediaEngine {
   }
 
   async generateImage(prompt: string, referenceImagePath?: string): Promise<Buffer | null> {
+    // Randomly pick style and aspect ratio to simulate natural phone usage
+    const styles: Array<'casual' | 'mirror' | 'close-up' | 'location'> = ['casual', 'mirror', 'close-up', 'location']
+    const style = styles[Math.floor(Math.random() * styles.length)]
+    // 70% chance 4:5 (portrait), 30% chance 9:16 (full body vertical)
+    const aspectRatio: '4:5' | '9:16' = Math.random() < 0.7 ? '4:5' : '9:16'
+
     return this.imageEngine.generateSelfie({
       prompt,
       referenceImagePath,
-      style: 'casual',
+      style,
+      aspectRatio,
     })
   }
 

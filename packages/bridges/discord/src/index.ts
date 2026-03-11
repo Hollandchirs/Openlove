@@ -4,8 +4,10 @@
  * Features:
  * - Text chat in DMs and channels
  * - Voice channel calls (join/leave, speak/listen)
+ * - Real-time voice conversation (STT → LLM → TTS loop)
  * - Send images (selfies), audio messages, videos
  * - Proactive messages from autonomous engine
+ * - Dynamic Rich Presence (listening, watching, browsing)
  * - Typing indicators for realism
  */
 
@@ -30,10 +32,21 @@ import {
   VoiceConnectionStatus,
   getVoiceConnection,
   entersState,
+  EndBehaviorType,
 } from '@discordjs/voice'
 import { ConversationEngine, OutgoingMessage } from '@openlove/core'
 import { MediaEngine } from '@openlove/media'
 import { Readable } from 'stream'
+import type { ActivityState } from '@openlove/autonomous'
+
+// Dynamic import for prism-media (Opus decoding)
+let prism: any = null
+async function loadPrism() {
+  if (!prism) {
+    prism = await import('prism-media')
+  }
+  return prism
+}
 
 export interface DiscordBridgeConfig {
   token: string
@@ -41,12 +54,15 @@ export interface DiscordBridgeConfig {
   ownerId: string
   engine: ConversationEngine
   media: MediaEngine
+  voiceConversationEnabled?: boolean
 }
 
 export class DiscordBridge {
   private client: Client
   private config: DiscordBridgeConfig
   private isTyping: Map<string, NodeJS.Timeout> = new Map()
+  private voiceConversationActive: Map<string, boolean> = new Map()
+  private isSpeaking: Map<string, boolean> = new Map()
 
   constructor(config: DiscordBridgeConfig) {
     this.config = config
@@ -67,19 +83,68 @@ export class DiscordBridge {
   private setupEventHandlers(): void {
     this.client.once(Events.ClientReady, (c) => {
       console.log(`[Discord] Logged in as ${c.user.tag}`)
-      this.setPresence()
+      this.setDefaultPresence()
     })
 
     this.client.on(Events.MessageCreate, this.handleMessage.bind(this))
     this.client.on(Events.VoiceStateUpdate, this.handleVoiceState.bind(this))
   }
 
-  private setPresence(): void {
+  private setDefaultPresence(): void {
     const { name } = this.config.engine.characterBlueprint
     this.client.user?.setPresence({
       activities: [{ name: `being ${name}`, type: ActivityType.Custom }],
       status: 'online',
     })
+  }
+
+  /**
+   * Update Discord Rich Presence based on current activity.
+   * Called by ActivityManager when the character starts/stops an activity.
+   */
+  updatePresence(activity: ActivityState): void {
+    if (!this.client.user) return
+
+    switch (activity.type) {
+      case 'listening':
+        this.client.user.setPresence({
+          activities: [{
+            name: `${activity.track} by ${activity.artist}`,
+            type: ActivityType.Listening,
+          }],
+          status: 'online',
+        })
+        console.log(`[Discord] Presence → Listening to ${activity.track} by ${activity.artist}`)
+        break
+
+      case 'watching':
+        this.client.user.setPresence({
+          activities: [{
+            name: activity.title,
+            type: ActivityType.Watching,
+          }],
+          status: 'online',
+        })
+        console.log(`[Discord] Presence → Watching ${activity.title}`)
+        break
+
+      case 'browsing':
+        this.client.user.setPresence({
+          activities: [{
+            name: activity.title ?? 'the internet',
+            type: ActivityType.Playing,
+          }],
+          status: 'online',
+        })
+        console.log(`[Discord] Presence → Browsing ${activity.title ?? 'the internet'}`)
+        break
+
+      case 'idle':
+      default:
+        this.setDefaultPresence()
+        console.log(`[Discord] Presence → Idle (being ${this.config.engine.characterBlueprint.name})`)
+        break
+    }
   }
 
   private async handleMessage(msg: Message): Promise<void> {
@@ -136,12 +201,192 @@ export class DiscordBridge {
         const audioBuffer = await this.config.media.textToSpeech(greeting.text)
         if (audioBuffer) await this.playAudio(newState.guild.id, audioBuffer)
       }
+
+      // Start voice conversation loop if enabled
+      if (this.config.voiceConversationEnabled !== false) {
+        this.startVoiceConversation(newState.guild.id)
+      }
     }
 
     if (userLeftVoice && oldState.guild) {
+      this.stopVoiceConversation(oldState.guild.id)
       this.leaveVoiceChannel(oldState.guild.id)
     }
   }
+
+  // ── Voice Conversation Loop ────────────────────────────────
+
+  /**
+   * Start listening to the owner's voice in a channel.
+   * Creates a loop: listen → transcribe → LLM → TTS → speak → repeat.
+   */
+  private startVoiceConversation(guildId: string): void {
+    const connection = getVoiceConnection(guildId)
+    if (!connection) return
+
+    this.voiceConversationActive.set(guildId, true)
+    console.log(`[Discord/Voice] Starting voice conversation in guild ${guildId}`)
+
+    this.listenForNextUtterance(guildId)
+  }
+
+  private stopVoiceConversation(guildId: string): void {
+    this.voiceConversationActive.set(guildId, false)
+    this.isSpeaking.set(guildId, false)
+    console.log(`[Discord/Voice] Stopped voice conversation in guild ${guildId}`)
+  }
+
+  private async listenForNextUtterance(guildId: string): Promise<void> {
+    if (!this.voiceConversationActive.get(guildId)) return
+
+    const connection = getVoiceConnection(guildId)
+    if (!connection) return
+
+    // Don't listen while we're speaking
+    if (this.isSpeaking.get(guildId)) {
+      setTimeout(() => this.listenForNextUtterance(guildId), 500)
+      return
+    }
+
+    try {
+      const receiver = connection.receiver
+
+      // Subscribe to the owner's audio — ends after 1.5s of silence
+      const opusStream = receiver.subscribe(this.config.ownerId, {
+        end: {
+          behavior: EndBehaviorType.AfterSilence,
+          duration: 1500,
+        },
+      })
+
+      // Collect and convert Opus → PCM → WAV
+      const audioBuffer = await this.collectOpusStream(opusStream)
+
+      if (!audioBuffer || audioBuffer.length < 4800) {
+        // Too short — probably just noise, skip and re-listen
+        this.listenForNextUtterance(guildId)
+        return
+      }
+
+      // Transcribe with Whisper
+      const transcription = await this.config.media.speechToText(audioBuffer)
+      if (!transcription || transcription.trim().length === 0) {
+        this.listenForNextUtterance(guildId)
+        return
+      }
+
+      console.log(`[Discord/Voice] Heard: "${transcription}"`)
+
+      // Generate LLM response
+      const response = await this.config.engine.respond({
+        content: transcription,
+        platform: 'discord-voice',
+        userId: this.config.ownerId,
+      })
+
+      // Speak the response back
+      if (response.text) {
+        this.isSpeaking.set(guildId, true)
+        const ttsBuffer = await this.config.media.textToSpeech(response.text)
+        if (ttsBuffer) {
+          await this.playAudio(guildId, ttsBuffer)
+        }
+        this.isSpeaking.set(guildId, false)
+      }
+
+      // Continue listening
+      this.listenForNextUtterance(guildId)
+    } catch (err) {
+      // Stream errors are normal when user stops talking or leaves
+      if (this.voiceConversationActive.get(guildId)) {
+        console.error('[Discord/Voice] Error in voice loop:', err)
+        // Retry after a short delay
+        setTimeout(() => this.listenForNextUtterance(guildId), 2000)
+      }
+    }
+  }
+
+  /**
+   * Collect an Opus audio stream from Discord, decode to PCM, wrap in WAV.
+   */
+  private async collectOpusStream(opusStream: Readable): Promise<Buffer | null> {
+    try {
+      const prismMedia = await loadPrism()
+
+      // Decode Opus to raw PCM (48kHz, 16-bit, mono)
+      const decoder = new prismMedia.opus.Decoder({
+        rate: 48000,
+        channels: 1,
+        frameSize: 960,
+      })
+
+      const pcmChunks: Buffer[] = []
+
+      return new Promise<Buffer | null>((resolve) => {
+        const pipeline = opusStream.pipe(decoder)
+
+        pipeline.on('data', (chunk: Buffer) => {
+          pcmChunks.push(chunk)
+        })
+
+        pipeline.on('end', () => {
+          if (pcmChunks.length === 0) {
+            resolve(null)
+            return
+          }
+          const pcm = Buffer.concat(pcmChunks)
+          resolve(this.wrapPcmAsWav(pcm, 48000, 1, 16))
+        })
+
+        pipeline.on('error', () => {
+          resolve(null)
+        })
+
+        // Safety timeout — max 30 seconds of recording
+        setTimeout(() => {
+          opusStream.destroy()
+        }, 30_000)
+      })
+    } catch (err) {
+      console.error('[Discord/Voice] Opus decode error:', err)
+      return null
+    }
+  }
+
+  /**
+   * Wrap raw PCM data in a WAV header so Whisper can accept it.
+   */
+  private wrapPcmAsWav(pcm: Buffer, sampleRate: number, channels: number, bitDepth: number): Buffer {
+    const byteRate = sampleRate * channels * (bitDepth / 8)
+    const blockAlign = channels * (bitDepth / 8)
+    const dataSize = pcm.length
+    const headerSize = 44
+
+    const header = Buffer.alloc(headerSize)
+
+    // RIFF header
+    header.write('RIFF', 0)
+    header.writeUInt32LE(dataSize + headerSize - 8, 4)
+    header.write('WAVE', 8)
+
+    // fmt sub-chunk
+    header.write('fmt ', 12)
+    header.writeUInt32LE(16, 16)         // sub-chunk size
+    header.writeUInt16LE(1, 20)          // PCM format
+    header.writeUInt16LE(channels, 22)
+    header.writeUInt32LE(sampleRate, 24)
+    header.writeUInt32LE(byteRate, 28)
+    header.writeUInt16LE(blockAlign, 32)
+    header.writeUInt16LE(bitDepth, 34)
+
+    // data sub-chunk
+    header.write('data', 36)
+    header.writeUInt32LE(dataSize, 40)
+
+    return Buffer.concat([header, pcm])
+  }
+
+  // ── Voice Channel Management ───────────────────────────────
 
   private async joinVoiceChannel(
     channelId: string,
@@ -184,6 +429,8 @@ export class DiscordBridge {
 
     await entersState(player, AudioPlayerStatus.Idle, 60_000)
   }
+
+  // ── Message Handling ───────────────────────────────────────
 
   /**
    * Send a response to a Discord channel, handling all media types.
@@ -274,6 +521,10 @@ export class DiscordBridge {
   }
 
   async stop(): Promise<void> {
+    // Stop all voice conversations
+    for (const guildId of this.voiceConversationActive.keys()) {
+      this.stopVoiceConversation(guildId)
+    }
     this.client.destroy()
   }
 }

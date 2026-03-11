@@ -25,6 +25,7 @@ export interface SelfieRequest {
   referenceImagePath?: string
   characterDescription?: string
   style?: 'casual' | 'mirror' | 'close-up' | 'location'
+  aspectRatio?: '4:5' | '9:16'
 }
 
 export class ImageEngine {
@@ -50,14 +51,15 @@ export class ImageEngine {
 
     try {
       const styledPrompt = this.buildImagePrompt(request)
+      const imageSize = this.getImageSize(request)
 
       // If we have a reference image, use IP-Adapter for consistency
       if (request.referenceImagePath && existsSync(request.referenceImagePath)) {
-        return await this.generateWithReference(styledPrompt, request.referenceImagePath)
+        return await this.generateWithReference(styledPrompt, request.referenceImagePath, imageSize)
       }
 
       // Direct generation without reference
-      return await this.generateDirect(styledPrompt)
+      return await this.generateDirect(styledPrompt, imageSize)
     } catch (err) {
       console.error('[Media/Image] Generation failed:', err)
       return null
@@ -66,10 +68,10 @@ export class ImageEngine {
 
   private buildImagePrompt(request: SelfieRequest): string {
     const stylePrefix: Record<NonNullable<SelfieRequest['style']>, string> = {
-      casual: 'casual selfie, natural lighting, smartphone camera, authentic',
-      mirror: 'full body mirror selfie, outfit visible, good lighting',
-      'close-up': 'close-up selfie, portrait, shallow depth of field, warm lighting',
-      location: 'selfie at a location, environment visible in background, candid',
+      casual: 'casual selfie shot on iPhone, natural lighting, smartphone camera, authentic, raw photo',
+      mirror: 'full body mirror selfie shot on iPhone, outfit visible, natural lighting, raw photo',
+      'close-up': 'close-up selfie portrait shot on iPhone, shallow depth of field, warm natural lighting, raw photo',
+      location: 'selfie at a location shot on iPhone, environment visible, candid, natural, raw photo',
     }
 
     const prefix = stylePrefix[request.style ?? 'casual']
@@ -80,11 +82,30 @@ export class ImageEngine {
       prefix,
       appearance,
       mainPrompt,
-      'photorealistic, high quality, natural, authentic',
+      'shot on iPhone 15 Pro, raw photo, ultra realistic, natural skin texture, no AI artifacts, authentic',
     ].filter(Boolean).join(', ')
   }
 
-  private async generateWithReference(prompt: string, imagePath: string): Promise<Buffer | null> {
+  private getImageSize(request: SelfieRequest): { width: number; height: number } {
+    const ratio = request.aspectRatio ?? this.defaultRatioForStyle(request.style)
+    switch (ratio) {
+      case '9:16': return { width: 576, height: 1024 }
+      case '4:5':  return { width: 832, height: 1040 }
+      default:     return { width: 832, height: 1040 }
+    }
+  }
+
+  private defaultRatioForStyle(style?: string): '4:5' | '9:16' {
+    switch (style) {
+      case 'mirror':   return '9:16'
+      case 'location': return '9:16'
+      case 'casual':   return '4:5'
+      case 'close-up': return '4:5'
+      default:         return '4:5'
+    }
+  }
+
+  private async generateWithReference(prompt: string, imagePath: string, imageSize: { width: number; height: number }): Promise<Buffer | null> {
     const imageData = readFileSync(imagePath)
     const base64Image = `data:image/jpeg;base64,${imageData.toString('base64')}`
 
@@ -94,6 +115,8 @@ export class ImageEngine {
         face_image_url: base64Image,
         guidance_scale: 7.5,
         num_inference_steps: 30,
+        width: imageSize.width,
+        height: imageSize.height,
       },
     }) as unknown as { images: Array<{ url: string }> }
 
@@ -101,14 +124,14 @@ export class ImageEngine {
     return await fetchImageAsBuffer(result.images[0].url)
   }
 
-  private async generateDirect(prompt: string): Promise<Buffer | null> {
-    const model = this.config.model ?? 'fal-ai/flux/dev'
+  private async generateDirect(prompt: string, imageSize: { width: number; height: number }): Promise<Buffer | null> {
+    const model = this.config.model ?? 'fal-ai/flux-realism'
 
     const result = await fal.subscribe(model, {
       input: {
         prompt,
         num_images: 1,
-        image_size: 'portrait_4_3',
+        image_size: imageSize,
         guidance_scale: 3.5,
         num_inference_steps: 28,
       },
