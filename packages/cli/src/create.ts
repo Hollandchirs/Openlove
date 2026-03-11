@@ -19,7 +19,7 @@ import { exec } from 'child_process'
 import { PRESETS, CharacterPreset, AppearanceConfig } from './presets.js'
 import { callLLMDirect } from './llm-direct.js'
 
-const ROOT_DIR = process.cwd()
+const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
 
 export interface CreatedCharacter {
   folderName: string

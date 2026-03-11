@@ -15,12 +15,14 @@ import chalk from 'chalk'
 import ora from 'ora'
 import boxen from 'boxen'
 import { writeFileSync, existsSync, readdirSync } from 'fs'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { createCharacterFlow } from './create.js'
 import { runTestChat } from './test-chat.js'
 import { PROVIDER_INFO, detectRegion, getProviderInfo } from './llm-direct.js'
 
-const ROOT_DIR = process.cwd()
+// pnpm sets INIT_CWD to where the user ran the command from (project root)
+// fall back to process.cwd() if not set
+const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
 
 export async function runSetupWizard(): Promise<void> {
   console.clear()

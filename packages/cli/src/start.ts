@@ -9,14 +9,16 @@
  * 5. Set up graceful shutdown
  */
 
-import 'dotenv/config'
+import dotenv from 'dotenv'
+import { resolve } from 'path'
+dotenv.config({ path: resolve(process.env.INIT_CWD ?? process.cwd(), '.env') })
 import chalk from 'chalk'
 import { ConversationEngine } from '@openlove/core'
 import { MediaEngine } from '@openlove/media'
 import { AutonomousScheduler, MusicEngine, DramaEngine } from '@openlove/autonomous'
 import { join } from 'path'
 
-const ROOT_DIR = process.cwd()
+const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
 
 export async function startOpenlove(): Promise<void> {
   console.log(chalk.magenta('\n  💝 Starting Openlove...\n'))
@@ -49,6 +51,8 @@ export async function startOpenlove(): Promise<void> {
   })
 
   console.log(chalk.green(`  ✓ ${engine.characterName} is waking up...`))
+  console.log(chalk.gray(`  Provider: ${config.LLM_PROVIDER} | Character dir: ${join(ROOT_DIR, 'characters', config.CHARACTER_NAME!)}`))
+
 
   // ── Initialize media engine ─────────────────────────────────────────────
   const media = new MediaEngine({
