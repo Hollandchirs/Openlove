@@ -207,6 +207,25 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
+  packages/openclaw-plugin:
+    dependencies:
+      '@openlove/autonomous':
+        specifier: workspace:*
+        version: link:../autonomous
+      '@openlove/core':
+        specifier: workspace:*
+        version: link:../core
+      '@openlove/media':
+        specifier: workspace:*
+        version: link:../media
+    devDependencies:
+      tsup:
+        specifier: ^8.3.0
+        version: 8.5.1(typescript@5.9.3)
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
 packages:
 
   '@anthropic-ai/sdk@0.32.1':

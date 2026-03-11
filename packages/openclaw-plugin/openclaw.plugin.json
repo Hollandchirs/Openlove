@@ -1,0 +1,45 @@
+{
+  "id": "openlove",
+  "name": "Openlove AI Companion",
+  "version": "0.1.0",
+  "description": "AI companion that lives on your computer — file access, browser automation, selfies, voice, music, and more",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "characterName": {
+        "type": "string",
+        "description": "Character folder name inside /characters/"
+      },
+      "charactersDir": {
+        "type": "string",
+        "description": "Path to characters directory"
+      },
+      "falKey": {
+        "type": "string",
+        "description": "fal.ai API key for image/video generation"
+      },
+      "elevenLabsApiKey": {
+        "type": "string",
+        "description": "ElevenLabs API key for TTS"
+      },
+      "elevenLabsVoiceId": {
+        "type": "string",
+        "description": "ElevenLabs voice ID"
+      },
+      "spotifyClientId": {
+        "type": "string",
+        "description": "Spotify client ID for music awareness"
+      },
+      "spotifyClientSecret": {
+        "type": "string",
+        "description": "Spotify client secret"
+      },
+      "browserAutomation": {
+        "type": "boolean",
+        "description": "Enable real browser windows via Playwright",
+        "default": true
+      }
+    },
+    "additionalProperties": false
+  }
+}
