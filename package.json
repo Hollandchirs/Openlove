@@ -6,6 +6,7 @@
   "scripts": {
     "setup": "pnpm --filter @openlove/cli run setup",
     "start": "pnpm --filter @openlove/cli run start",
+    "wakeup": "pnpm --filter @openlove/cli run wakeup",
     "create-character": "pnpm --filter @openlove/cli run create",
     "dev": "turbo run dev",
     "build": "turbo run build",

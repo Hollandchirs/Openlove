@@ -28,8 +28,9 @@ async function main(): Promise<void> {
       // Default action if no command given — check if setup is done
       const { existsSync } = await import('fs')
       const { join } = await import('path')
+      const rootDir = process.env.INIT_CWD ?? process.cwd()
 
-      if (!existsSync(join(process.cwd(), '.env'))) {
+      if (!existsSync(join(rootDir, '.env'))) {
         console.log(chalk.yellow('\n  No .env found. Running setup wizard...\n'))
         const { runSetupWizard } = await import('./setup.js')
         await runSetupWizard()
@@ -37,6 +38,26 @@ async function main(): Promise<void> {
       }
 
       const { startOpenlove } = await import('./start.js')
+      await startOpenlove()
+      break
+    }
+
+    case 'wakeup':
+    case 'wake':
+    case 'restart': {
+      const { existsSync } = await import('fs')
+      const { join } = await import('path')
+      const rootDir = process.env.INIT_CWD ?? process.cwd()
+
+      if (!existsSync(join(rootDir, '.env'))) {
+        console.log(chalk.yellow('\n  No .env found. Running setup first...\n'))
+        const { runSetupWizard } = await import('./setup.js')
+        await runSetupWizard()
+      }
+
+      console.log(chalk.magenta('\n  💝 Waking up Openlove...\n'))
+      const { killExistingProcess, startOpenlove } = await import('./start.js')
+      killExistingProcess()
       await startOpenlove()
       break
     }
@@ -83,6 +104,7 @@ async function main(): Promise<void> {
   ${chalk.bold('Usage:')}
     ${chalk.cyan('pnpm setup')}        First-time setup wizard
     ${chalk.cyan('pnpm start')}        Start your companion
+    ${chalk.cyan('pnpm wakeup')}       Kill existing process + restart
     ${chalk.cyan('pnpm create-character')}   Create a new companion
     ${chalk.cyan('pnpm status')}       Show current status
 

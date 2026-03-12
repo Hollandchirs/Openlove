@@ -5,7 +5,12 @@
  * taking selfies, sending voice messages, managing memories, etc.
  */
 
-import type { ToolDefinition } from './computer.js'
+export interface ToolDefinition {
+  name: string
+  description: string
+  parameters: Record<string, any>
+  execute: (params: Record<string, any>) => Promise<string>
+}
 
 /**
  * Creates companion tools that depend on runtime instances.

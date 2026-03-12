@@ -24,6 +24,15 @@ import {
   VoiceState,
   ChannelType,
 } from 'discord.js'
+import { appendFileSync } from 'fs'
+
+const DEBUG_LOG = '/tmp/openlove-debug.log'
+function debugLog(msg: string): void {
+  const ts = new Date().toISOString()
+  const line = `[${ts}] ${msg}\n`
+  console.log(msg)
+  try { appendFileSync(DEBUG_LOG, line) } catch { /* ignore */ }
+}
 import {
   joinVoiceChannel,
   createAudioPlayer,
@@ -63,6 +72,9 @@ export class DiscordBridge {
   private isTyping: Map<string, NodeJS.Timeout> = new Map()
   private voiceConversationActive: Map<string, boolean> = new Map()
   private isSpeaking: Map<string, boolean> = new Map()
+  private processedMessages: Set<string> = new Set()
+  /** Per-user lock to prevent duplicate concurrent engine.respond() calls */
+  private userProcessing: Set<string> = new Set()
 
   constructor(config: DiscordBridgeConfig) {
     this.config = config
@@ -75,6 +87,17 @@ export class DiscordBridge {
         GatewayIntentBits.DirectMessages,
       ],
       partials: [Partials.Channel, Partials.Message],
+      ws: {
+        handshakeTimeout: 60_000, // 60s instead of default 30s
+      },
+    })
+
+    // Prevent unhandled WebSocket errors from crashing the process
+    this.client.on('error', (err) => {
+      console.error('[Discord] Client error:', err.message)
+    })
+    this.client.ws.on('error' as any, (err: Error) => {
+      console.error('[Discord] WebSocket error:', err.message)
     })
 
     this.setupEventHandlers()
@@ -151,6 +174,15 @@ export class DiscordBridge {
     // Ignore messages from bots (including self)
     if (msg.author.bot) return
 
+    // Deduplicate — Discord can fire MessageCreate twice for the same message
+    if (this.processedMessages.has(msg.id)) return
+    this.processedMessages.add(msg.id)
+    // Prevent memory leak: prune old IDs (keep last 100)
+    if (this.processedMessages.size > 100) {
+      const first = this.processedMessages.values().next().value
+      if (first) this.processedMessages.delete(first)
+    }
+
     // Only respond to: DMs, or messages that @mention the bot
     const isDM = msg.channel.type === ChannelType.DM
     const isMentioned = this.client.user && msg.mentions.has(this.client.user)
@@ -160,6 +192,14 @@ export class DiscordBridge {
     const content = msg.content.replace(/<@!?\d+>/g, '').trim()
     if (!content) return
 
+    // Per-user lock: prevent processing a new message while still responding to the previous one
+    const userId = msg.author.id
+    if (this.userProcessing.has(userId)) {
+      debugLog(`[Discord] Skipping message from ${userId} — still processing previous message`)
+      return
+    }
+    this.userProcessing.add(userId)
+
     // Show typing indicator
     await this.startTyping(msg)
 
@@ -167,15 +207,17 @@ export class DiscordBridge {
       const response = await this.config.engine.respond({
         content,
         platform: 'discord',
-        userId: msg.author.id,
+        userId,
       })
 
+      debugLog(`[Discord] Engine response: text="${response.text.slice(0, 80)}...", actions=${JSON.stringify(response.actions ?? [])}`)
       await this.sendResponse(msg.channel as TextChannel | DMChannel, response)
     } catch (err) {
-      console.error('[Discord] Error handling message:', err)
+      debugLog(`[Discord] Error handling message: ${err instanceof Error ? err.stack : err}`)
       await msg.reply('give me a sec... 😅')
     } finally {
       this.stopTyping(msg.channelId)
+      this.userProcessing.delete(userId)
     }
   }
 
@@ -445,8 +487,11 @@ export class DiscordBridge {
 
     // Send text
     if (response.text) {
+      // Clean up excessive blank lines (LLM leaves gaps where tags should be)
+      const cleanText = response.text.replace(/\n\s*\n\s*\n/g, '\n\n').trim()
+      if (!cleanText) return
       // Split long messages naturally at sentence boundaries
-      const chunks = splitMessage(response.text)
+      const chunks = splitMessage(cleanText)
       for (const chunk of chunks) {
         await channel.send(chunk)
         if (chunks.length > 1) {
@@ -456,36 +501,67 @@ export class DiscordBridge {
     }
 
     // Handle actions (image, voice, video)
-    if (response.actions) {
+    debugLog(`[Discord] Response has ${response.actions?.length ?? 0} action(s), text length: ${response.text.length}`)
+    if (response.actions && response.actions.length > 0) {
+      debugLog(`[Discord] Processing ${response.actions.length} action(s): ${JSON.stringify(response.actions.map(a => a.type))}`)
       for (const action of response.actions) {
         await new Promise(r => setTimeout(r, 1000))
 
+        try {
         if (action.type === 'send_image') {
+          debugLog(`[Discord] Generating image: prompt="${action.prompt}", style="${action.style}", refPath="${this.config.engine.characterBlueprint.referenceImagePath}"`)
           const imageBuffer = await this.config.media.generateImage(
             action.prompt,
             this.config.engine.characterBlueprint.referenceImagePath,
             action.style
           )
           if (imageBuffer) {
+            debugLog(`[Discord] Image generated: ${imageBuffer.length} bytes, sending to Discord...`)
             const attachment = new AttachmentBuilder(imageBuffer, { name: 'photo.jpg' })
             await channel.send({ files: [attachment] })
+            debugLog(`[Discord] Image sent successfully`)
+          } else {
+            debugLog(`[Discord] Image generation returned null — check FAL_KEY and API status`)
           }
         }
 
         if (action.type === 'send_voice') {
+          debugLog(`[Discord] Generating voice: text="${action.text.slice(0, 80)}"`)
           const audioBuffer = await this.config.media.textToSpeech(action.text)
           if (audioBuffer) {
+            debugLog(`[Discord] Voice generated: ${audioBuffer.length} bytes, sending to Discord...`)
             const attachment = new AttachmentBuilder(audioBuffer, { name: 'voice-message.mp3' })
             await channel.send({ files: [attachment] })
+            debugLog(`[Discord] Voice sent successfully`)
+          } else {
+            debugLog(`[Discord] Voice generation returned null — check TTS_PROVIDER and API keys`)
+            // Fallback: send the text as a regular message so user isn't left hanging
+            await channel.send(`*${action.text}*`)
           }
         }
 
         if (action.type === 'send_video') {
-          const videoBuffer = await this.config.media.generateVideo(action.prompt)
+          debugLog(`[Discord] Generating video: prompt="${action.prompt.slice(0, 80)}"`)
+          // Video takes ~35s, keep typing indicator alive (refreshes every 8s, expires after 10s)
+          const typingInterval = setInterval(() => { channel.sendTyping().catch(() => {}) }, 8_000)
+          await channel.sendTyping()
+          let videoBuffer: Buffer | null = null
+          try {
+            videoBuffer = await this.config.media.generateVideo(action.prompt)
+          } finally {
+            clearInterval(typingInterval)
+          }
           if (videoBuffer) {
+            debugLog(`[Discord] Video generated: ${videoBuffer.length} bytes, sending to Discord...`)
             const attachment = new AttachmentBuilder(videoBuffer, { name: 'video.mp4' })
             await channel.send({ files: [attachment] })
+            debugLog(`[Discord] Video sent successfully`)
+          } else {
+            debugLog(`[Discord] Video generation returned null — check FAL_KEY and API status`)
           }
+        }
+        } catch (err) {
+          debugLog(`[Discord] Action ${action.type} failed: ${err instanceof Error ? err.stack : err}`)
         }
       }
     }

@@ -274,7 +274,7 @@ export async function runSetupWizard(): Promise<void> {
     message: 'Which optional features do you want to enable?',
     choices: [
       { name: '📸 Selfies — she can send photos of herself (needs fal.ai key)', value: 'images', checked: true },
-      { name: '🎤 Voice messages — she can send voice notes (needs ElevenLabs key)', value: 'voice' },
+      { name: '🎤 Voice messages — she can send voice notes (ElevenLabs / Fish Audio / FAL Kokoro)', value: 'voice' },
       { name: '🎵 Music awareness — she listens to Spotify and shares songs (needs Spotify key)', value: 'spotify' },
     ],
   }])
@@ -292,17 +292,86 @@ export async function runSetupWizard(): Promise<void> {
   }
 
   if (optionalFeatures.includes('voice')) {
-    console.log(chalk.yellow('\n  👉 ElevenLabs API key (10,000 characters/month free):'))
-    console.log(chalk.gray('  https://elevenlabs.io → Sign up → Profile → API Key\n'))
-    const { elKey } = await inquirer.prompt([{
-      type: 'password',
-      name: 'elKey',
-      message: 'Paste your ElevenLabs API key (or press Enter to skip):',
-      mask: '*',
+    const { ttsProvider } = await inquirer.prompt([{
+      type: 'list',
+      name: 'ttsProvider',
+      message: isCN ? '选择语音合成（TTS）提供商:' : 'Which voice provider?',
+      choices: [
+        {
+          name: `🗣️  ElevenLabs\n     ${chalk.gray(isCN ? '最自然、情感丰富，$5/月或免费额度' : 'Most natural, emotional — $5/mo or free tier')}`,
+          value: 'elevenlabs',
+          short: 'ElevenLabs',
+        },
+        {
+          name: `🐟  Fish Audio\n     ${chalk.gray(isCN ? '中英文支持好，有免费额度' : 'Good Chinese/English, free tier available')}`,
+          value: 'fishaudio',
+          short: 'Fish Audio',
+        },
+        {
+          name: `⚡  FAL Kokoro\n     ${chalk.gray(isCN ? '最便宜 $0.02/千字符，用已有的 fal.ai key' : 'Cheapest $0.02/1K chars, reuses your fal.ai key')}`,
+          value: 'fal',
+          short: 'FAL Kokoro',
+        },
+      ],
     }])
-    if (elKey) {
-      envValues.ELEVENLABS_API_KEY = elKey
-      envValues.TTS_PROVIDER = 'elevenlabs'
+
+    envValues.TTS_PROVIDER = ttsProvider
+
+    if (ttsProvider === 'elevenlabs') {
+      console.log(chalk.yellow('\n  👉 ElevenLabs API key (10,000 characters/month free):'))
+      console.log(chalk.gray('  https://elevenlabs.io → Sign up → Profile → API Key\n'))
+      const answers = await inquirer.prompt([
+        {
+          type: 'password',
+          name: 'apiKey',
+          message: 'Paste your ElevenLabs API key (or press Enter to skip):',
+          mask: '*',
+        },
+        {
+          type: 'input',
+          name: 'voiceId',
+          message: isCN ? 'Voice ID（可选，默认 Rachel）:' : 'Voice ID (optional, default Rachel):',
+        },
+      ])
+      if (answers.apiKey) envValues.ELEVENLABS_API_KEY = answers.apiKey
+      if (answers.voiceId) envValues.ELEVENLABS_VOICE_ID = answers.voiceId
+    }
+
+    if (ttsProvider === 'fishaudio') {
+      console.log(chalk.yellow('\n  👉 Fish Audio API key:'))
+      console.log(chalk.gray('  https://fish.audio → Sign up → Profile → API Keys\n'))
+      const answers = await inquirer.prompt([
+        {
+          type: 'password',
+          name: 'apiKey',
+          message: 'Paste your Fish Audio API key (or press Enter to skip):',
+          mask: '*',
+        },
+        {
+          type: 'input',
+          name: 'voiceId',
+          message: isCN ? 'Voice ID（在 fish.audio 声音库找）:' : 'Voice ID (find in Fish Audio voice library):',
+        },
+      ])
+      if (answers.apiKey) envValues.FISH_AUDIO_API_KEY = answers.apiKey
+      if (answers.voiceId) envValues.FISH_AUDIO_VOICE_ID = answers.voiceId
+    }
+
+    if (ttsProvider === 'fal') {
+      console.log(chalk.cyan(isCN
+        ? '\n  ℹ️ FAL Kokoro 使用你已有的 fal.ai key，无需额外配置'
+        : '\n  ℹ️ FAL Kokoro reuses your fal.ai key — no extra setup needed'
+      ))
+      if (!envValues.FAL_KEY) {
+        console.log(chalk.yellow('  👉 https://fal.ai → Dashboard → API Keys\n'))
+        const { falKey } = await inquirer.prompt([{
+          type: 'password',
+          name: 'falKey',
+          message: 'Paste your fal.ai API key:',
+          mask: '*',
+        }])
+        if (falKey) envValues.FAL_KEY = falKey
+      }
     }
   }
 

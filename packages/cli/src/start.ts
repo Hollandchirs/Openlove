@@ -17,11 +17,80 @@ import { ConversationEngine } from '@openlove/core'
 import { MediaEngine } from '@openlove/media'
 import { AutonomousScheduler, MusicEngine, DramaEngine, ActivityManager, BrowserAgent } from '@openlove/autonomous'
 import { join } from 'path'
+import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'fs'
 
 const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
+const PID_FILE = join(ROOT_DIR, '.openlove.pid')
+
+/**
+ * Kill any existing Openlove process found in the PID file.
+ * Returns true if a process was killed.
+ */
+export function killExistingProcess(): boolean {
+  if (!existsSync(PID_FILE)) return false
+
+  try {
+    const pid = parseInt(readFileSync(PID_FILE, 'utf-8').trim(), 10)
+    if (isNaN(pid)) {
+      unlinkSync(PID_FILE)
+      return false
+    }
+
+    // Check if process is alive
+    try {
+      process.kill(pid, 0) // signal 0 = just check existence
+    } catch {
+      // Process doesn't exist — stale PID file
+      unlinkSync(PID_FILE)
+      return false
+    }
+
+    console.log(chalk.yellow(`  Stopping existing process (PID ${pid})...`))
+    process.kill(pid, 'SIGTERM')
+
+    // Brief sync wait for process to exit
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0)
+        // Still alive, wait a bit
+        const waitUntil = Date.now() + 100
+        while (Date.now() < waitUntil) { /* spin */ }
+      } catch {
+        // Process exited
+        break
+      }
+    }
+
+    // Force kill if still alive
+    try {
+      process.kill(pid, 0)
+      console.log(chalk.yellow(`  Process still alive, sending SIGKILL...`))
+      process.kill(pid, 'SIGKILL')
+    } catch { /* already dead */ }
+
+    try { unlinkSync(PID_FILE) } catch { /* ignore */ }
+    console.log(chalk.green(`  Previous process stopped.`))
+    return true
+  } catch {
+    try { unlinkSync(PID_FILE) } catch { /* ignore */ }
+    return false
+  }
+}
+
+function writePidFile(): void {
+  writeFileSync(PID_FILE, String(process.pid), 'utf-8')
+}
+
+function cleanupPidFile(): void {
+  try { unlinkSync(PID_FILE) } catch { /* ignore */ }
+}
 
 export async function startOpenlove(): Promise<void> {
   console.log(chalk.magenta('\n  💝 Starting Openlove...\n'))
+
+  // Write PID file for process management
+  writePidFile()
 
   // ── Validate environment ────────────────────────────────────────────────
   const config = loadConfig()
@@ -59,15 +128,20 @@ export async function startOpenlove(): Promise<void> {
     image: {
       falKey: config.FAL_KEY,
       model: config.IMAGE_MODEL,
+      referenceModel: config.IMAGE_REFERENCE_MODEL,
     },
     voice: {
+      provider: config.TTS_PROVIDER as any ?? (config.FAL_KEY ? 'fal' : 'elevenlabs'),
       elevenLabsApiKey: config.ELEVENLABS_API_KEY,
       elevenLabsVoiceId: config.ELEVENLABS_VOICE_ID,
+      fishAudioApiKey: config.FISH_AUDIO_API_KEY,
+      fishAudioVoiceId: config.FISH_AUDIO_VOICE_ID,
+      falKey: config.FAL_KEY,
       openaiApiKey: config.OPENAI_API_KEY,
-      provider: config.TTS_PROVIDER as any ?? 'edge-tts',
     },
     video: {
       falKey: config.FAL_KEY,
+      referenceImagePath: engine.characterBlueprint.referenceImagePath,
     },
   })
 
@@ -76,9 +150,9 @@ export async function startOpenlove(): Promise<void> {
   // ── Initialize activity manager ────────────────────────────────────────
   const activityManager = new ActivityManager()
 
-  // Browser agent (optional — requires Playwright)
+  // Browser agent (optional — requires Playwright, disabled by default)
   let browserAgent: BrowserAgent | undefined
-  if (config.BROWSER_AUTOMATION_ENABLED !== 'false') {
+  if (config.BROWSER_AUTOMATION_ENABLED === 'true') {
     browserAgent = new BrowserAgent()
   }
 
@@ -182,12 +256,22 @@ export async function startOpenlove(): Promise<void> {
     console.log(chalk.yellow(`\n  Received ${signal}. Shutting down gracefully...`))
     scheduler.stop()
     await Promise.allSettled(bridges.map(b => b.stop()))
+    cleanupPidFile()
     console.log(chalk.gray('  Goodbye 💝'))
     process.exit(0)
   }
 
   process.on('SIGINT', () => shutdown('SIGINT'))
   process.on('SIGTERM', () => shutdown('SIGTERM'))
+
+  // Prevent unhandled errors from crashing the process
+  process.on('unhandledRejection', (err) => {
+    console.error(chalk.red('  [Unhandled Rejection]'), err instanceof Error ? err.message : err)
+  })
+  process.on('uncaughtException', (err) => {
+    console.error(chalk.red('  [Uncaught Exception]'), err.message)
+    // Don't exit — let the bot keep running
+  })
 }
 
 function loadConfig(): Record<string, string | undefined> {
@@ -215,9 +299,12 @@ function loadConfig(): Record<string, string | undefined> {
     WHATSAPP_ENABLED: process.env.WHATSAPP_ENABLED,
     FAL_KEY: process.env.FAL_KEY,
     IMAGE_MODEL: process.env.IMAGE_MODEL,
+    IMAGE_REFERENCE_MODEL: process.env.IMAGE_REFERENCE_MODEL,
     ELEVENLABS_API_KEY: process.env.ELEVENLABS_API_KEY,
     ELEVENLABS_VOICE_ID: process.env.ELEVENLABS_VOICE_ID,
     TTS_PROVIDER: process.env.TTS_PROVIDER,
+    FISH_AUDIO_API_KEY: process.env.FISH_AUDIO_API_KEY,
+    FISH_AUDIO_VOICE_ID: process.env.FISH_AUDIO_VOICE_ID,
     SPOTIFY_CLIENT_ID: process.env.SPOTIFY_CLIENT_ID,
     SPOTIFY_CLIENT_SECRET: process.env.SPOTIFY_CLIENT_SECRET,
     TMDB_API_KEY: process.env.TMDB_API_KEY,

@@ -2,11 +2,18 @@
  * Image Generation Engine
  *
  * Generates character selfies with visual consistency.
- * Primary: fal.ai FLUX 2 Realism LoRA (photorealistic, portrait ratios)
- * Fallback: fal.ai flux-realism (original)
+ *
+ * Model hierarchy (reference image available):
+ *   1. fal-ai/flux-pulid — FLUX-based face consistency (best quality)
+ *   2. fal-ai/instant-character — character consistency across poses
+ *   3. fal-ai/ip-adapter-face-id — legacy SD-based fallback
+ *
+ * Model hierarchy (no reference image):
+ *   1. fal-ai/nano-banana — Google's photorealistic model
+ *   2. fal-ai/flux-realism — FLUX realism LoRA fallback
  *
  * Visual consistency strategy:
- *   - IP-Adapter reference image anchors face/style
+ *   - Reference image anchors face/style via PuLID or InstantCharacter
  *   - Consistent style prefix in every prompt
  *   - Character appearance description from SOUL.md
  *
@@ -14,12 +21,73 @@
  * NEVER generates 1:1 square images — always portrait like a real phone.
  */
 
-import { fal } from '@fal-ai/client'
-import { readFileSync, existsSync } from 'fs'
+import { readFileSync, existsSync, appendFileSync } from 'fs'
+
+function debugLog(msg: string): void {
+  const ts = new Date().toISOString()
+  const line = `[${ts}] ${msg}\n`
+  console.log(msg)
+  try { appendFileSync('/tmp/openlove-debug.log', line) } catch { /* ignore */ }
+}
+
+/**
+ * Direct REST API call to fal.ai queue — 3x faster than SDK subscribe.
+ * SDK subscribe: ~20s (polling with long sleep intervals)
+ * Direct REST:   ~8s  (tight 500ms polling loop)
+ */
+async function falQueueRun(model: string, input: Record<string, any>, falKey: string): Promise<any> {
+  // Step 1: Submit to queue
+  const submitResp = await fetch(`https://queue.fal.run/${model}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Key ${falKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(input),
+  })
+
+  if (!submitResp.ok) {
+    const errText = await submitResp.text()
+    throw new Error(`FAL submit failed (${submitResp.status}): ${errText}`)
+  }
+
+  const { request_id: requestId } = await submitResp.json() as { request_id: string }
+  debugLog(`[FAL] Submitted ${model}: request_id=${requestId}`)
+
+  // Step 2: Poll for result with tight loop (500ms)
+  const maxWait = 120_000 // 2 min timeout
+  const start = Date.now()
+
+  while (Date.now() - start < maxWait) {
+    const statusResp = await fetch(
+      `https://queue.fal.run/${model}/requests/${requestId}/status`,
+      { headers: { 'Authorization': `Key ${falKey}` } }
+    )
+    const status = await statusResp.json() as { status: string }
+
+    if (status.status === 'COMPLETED') {
+      const resultResp = await fetch(
+        `https://queue.fal.run/${model}/requests/${requestId}`,
+        { headers: { 'Authorization': `Key ${falKey}` } }
+      )
+      return await resultResp.json()
+    }
+
+    if (status.status === 'FAILED') {
+      throw new Error(`FAL job failed: ${JSON.stringify(status)}`)
+    }
+
+    // Tight polling — 500ms between checks
+    await new Promise(r => setTimeout(r, 500))
+  }
+
+  throw new Error(`FAL job timed out after ${maxWait / 1000}s`)
+}
 
 export interface ImageConfig {
   falKey?: string
-  model?: string
+  model?: string          // override for direct generation model
+  referenceModel?: string // override for reference-based model
   defaultStyle?: string
 }
 
@@ -39,9 +107,6 @@ export class ImageEngine {
 
   constructor(config: ImageConfig) {
     this.config = config
-    if (config.falKey) {
-      fal.config({ credentials: config.falKey })
-    }
   }
 
   async generateSelfie(request: SelfieRequest): Promise<Buffer | null> {
@@ -54,15 +119,21 @@ export class ImageEngine {
       const styledPrompt = this.buildImagePrompt(request)
       const imageSize = this.getImageSizePreset(request)
 
-      console.log(`[Media/Image] Generating: style=${request.style ?? 'casual'}, ratio=${imageSize}, model=${this.config.model ?? 'fal-ai/flux-realism'}`)
+      debugLog(`[Media/Image] Generating: style=${request.style ?? 'casual'}, ratio=${imageSize}`)
 
       if (request.referenceImagePath && existsSync(request.referenceImagePath)) {
-        return await this.generateWithReference(styledPrompt, request.referenceImagePath, imageSize)
+        debugLog(`[Media/Image] Using reference image: ${request.referenceImagePath}`)
+        const result = await this.generateWithReference(styledPrompt, request.referenceImagePath, imageSize)
+        debugLog(`[Media/Image] generateWithReference result: ${result ? `${result.length} bytes` : 'null'}`)
+        return result
       }
 
-      return await this.generateDirect(styledPrompt, imageSize)
+      debugLog(`[Media/Image] No reference image, using direct generation`)
+      const result = await this.generateDirect(styledPrompt, imageSize)
+      debugLog(`[Media/Image] generateDirect result: ${result ? `${result.length} bytes` : 'null'}`)
+      return result
     } catch (err) {
-      console.error('[Media/Image] Generation failed:', err)
+      debugLog(`[Media/Image] Generation FAILED: ${err instanceof Error ? err.stack : err}`)
       return null
     }
   }
@@ -116,51 +187,191 @@ export class ImageEngine {
   }
 
   /**
-   * IP-Adapter face-id generation — uses reference image for face consistency.
-   * Note: ip-adapter-face-id uses width/height numbers, not string presets.
+   * Reference-based generation with face consistency.
+   * Tries models in order: PuLID → InstantCharacter → IP-Adapter (fallback).
    */
   private async generateWithReference(prompt: string, imagePath: string, imageSize: FalImageSize): Promise<Buffer | null> {
     const imageData = readFileSync(imagePath)
     const base64Image = `data:image/jpeg;base64,${imageData.toString('base64')}`
-
-    // Convert string preset to pixel dimensions for ip-adapter
     const dims = this.presetToPixels(imageSize)
 
-    const result = await fal.subscribe('fal-ai/ip-adapter-face-id', {
-      input: {
+    const refModel = this.config.referenceModel ?? 'fal-ai/flux-pulid'
+
+    // Try PuLID (FLUX-based, best quality)
+    if (refModel === 'fal-ai/flux-pulid') {
+      const result = await this.tryPuLID(prompt, base64Image, imageSize)
+      if (result) return result
+      debugLog(`[Media/Image] PuLID failed, falling back to InstantCharacter`)
+    }
+
+    // Try InstantCharacter
+    if (refModel === 'fal-ai/instant-character' || refModel === 'fal-ai/flux-pulid') {
+      const result = await this.tryInstantCharacter(prompt, base64Image, imageSize)
+      if (result) return result
+      debugLog(`[Media/Image] InstantCharacter failed, falling back to IP-Adapter`)
+    }
+
+    // Fallback: IP-Adapter face-id (legacy)
+    return await this.tryIPAdapter(prompt, base64Image, dims)
+  }
+
+  /**
+   * PuLID: FLUX-based tuning-free face consistency.
+   * Best photorealism with single reference image.
+   */
+  private async tryPuLID(prompt: string, referenceImageUrl: string, imageSize: FalImageSize): Promise<Buffer | null> {
+    try {
+      debugLog(`[Media/Image] Trying fal-ai/flux-pulid`)
+
+      const result = await falQueueRun('fal-ai/flux-pulid', {
+        prompt,
+        reference_image_url: referenceImageUrl,
+        image_size: imageSize,
+        guidance_scale: 4,
+        num_inference_steps: 20,
+        id_weight: 0.5,  // lower = better looking, more prompt-following; higher = more face-locked
+      }, this.config.falKey!)
+
+      debugLog(`[Media/Image] PuLID result keys: ${JSON.stringify(Object.keys(result))}`)
+      return this.extractImageFromResult(result, 'PuLID')
+    } catch (err) {
+      debugLog(`[Media/Image] PuLID error: ${err instanceof Error ? err.message : err}`)
+      return null
+    }
+  }
+
+  /**
+   * InstantCharacter: character consistency across poses and scenes.
+   */
+  private async tryInstantCharacter(prompt: string, imageUrl: string, imageSize: FalImageSize): Promise<Buffer | null> {
+    try {
+      debugLog(`[Media/Image] Trying fal-ai/instant-character`)
+
+      const result = await falQueueRun('fal-ai/instant-character', {
+        prompt,
+        image_url: imageUrl,
+        image_size: imageSize,
+        guidance_scale: 3.5,
+        num_inference_steps: 28,
+        scale: 1.0,
+        num_images: 1,
+        output_format: 'jpeg',
+      }, this.config.falKey!)
+
+      debugLog(`[Media/Image] InstantCharacter result keys: ${JSON.stringify(Object.keys(result))}`)
+      return this.extractImageFromResult(result, 'InstantCharacter')
+    } catch (err) {
+      debugLog(`[Media/Image] InstantCharacter error: ${err instanceof Error ? err.message : err}`)
+      return null
+    }
+  }
+
+  /**
+   * IP-Adapter face-id: legacy SD-based fallback.
+   */
+  private async tryIPAdapter(prompt: string, base64Image: string, dims: { width: number; height: number }): Promise<Buffer | null> {
+    try {
+      debugLog(`[Media/Image] Trying fal-ai/ip-adapter-face-id (legacy fallback): ${dims.width}x${dims.height}`)
+
+      const result = await falQueueRun('fal-ai/ip-adapter-face-id', {
         prompt,
         face_image_url: base64Image,
         guidance_scale: 7.5,
         num_inference_steps: 30,
         width: dims.width,
         height: dims.height,
-      },
-    }) as unknown as { images: Array<{ url: string }> }
+      }, this.config.falKey!)
 
-    if (!result.images?.[0]?.url) return null
-    return await fetchImageAsBuffer(result.images[0].url)
+      debugLog(`[Media/Image] IP-Adapter result keys: ${JSON.stringify(Object.keys(result))}`)
+      return this.extractImageFromResult(result, 'IP-Adapter')
+    } catch (err) {
+      debugLog(`[Media/Image] IP-Adapter error: ${err instanceof Error ? err.message : err}`)
+      return null
+    }
   }
 
   /**
    * Direct generation without reference image.
-   * Uses FLUX Realism model with string preset for guaranteed correct aspect ratio.
+   * Tries Nano Banana first, falls back to FLUX Realism.
    */
   private async generateDirect(prompt: string, imageSize: FalImageSize): Promise<Buffer | null> {
-    const model = this.config.model ?? 'fal-ai/flux-realism'
+    const model = this.config.model ?? 'fal-ai/nano-banana'
 
-    const result = await fal.subscribe(model, {
-      input: {
+    // Try primary model
+    const result = await this.tryDirectModel(prompt, imageSize, model)
+    if (result) return result
+
+    // Fallback to flux-realism if primary fails
+    if (model !== 'fal-ai/flux-realism') {
+      debugLog(`[Media/Image] ${model} failed, falling back to fal-ai/flux-realism`)
+      return await this.tryDirectModel(prompt, imageSize, 'fal-ai/flux-realism')
+    }
+
+    return null
+  }
+
+  private async tryDirectModel(prompt: string, imageSize: FalImageSize, model: string): Promise<Buffer | null> {
+    try {
+      debugLog(`[Media/Image] Trying direct model: ${model}`)
+
+      // Nano Banana uses aspect_ratio string instead of image_size preset
+      const isNanoBanana = model.includes('nano-banana')
+      const aspectRatio = this.imageSizeToAspectRatio(imageSize)
+
+      const input: Record<string, any> = {
         prompt,
         num_images: 1,
-        image_size: imageSize,
-        guidance_scale: 3.5,
-        num_inference_steps: 28,
         output_format: 'jpeg',
-      },
-    }) as unknown as { images: Array<{ url: string }> }
+      }
 
-    if (!result.images?.[0]?.url) return null
-    return await fetchImageAsBuffer(result.images[0].url)
+      if (isNanoBanana) {
+        input.aspect_ratio = aspectRatio
+      } else {
+        input.image_size = imageSize
+        input.guidance_scale = 3.5
+        input.num_inference_steps = 28
+      }
+
+      const result = await falQueueRun(model, input, this.config.falKey!)
+
+      debugLog(`[Media/Image] ${model} result keys: ${JSON.stringify(Object.keys(result))}`)
+      return this.extractImageFromResult(result, model)
+    } catch (err) {
+      debugLog(`[Media/Image] ${model} error: ${err instanceof Error ? err.message : err}`)
+      return null
+    }
+  }
+
+  /**
+   * Extract image URL from various FAL response shapes.
+   * Different models return different structures.
+   */
+  private async extractImageFromResult(result: any, modelName: string): Promise<Buffer | null> {
+    // Direct REST API returns flat structure (no data wrapper)
+    const imageUrl = result?.images?.[0]?.url
+      ?? result?.image?.url
+      ?? result?.data?.images?.[0]?.url
+      ?? result?.data?.image?.url
+
+    if (!imageUrl) {
+      debugLog(`[Media/Image] ${modelName}: no image URL in result: ${JSON.stringify(result).slice(0, 500)}`)
+      return null
+    }
+
+    debugLog(`[Media/Image] ${modelName}: downloading from ${imageUrl.slice(0, 80)}...`)
+    return await fetchImageAsBuffer(imageUrl)
+  }
+
+  private imageSizeToAspectRatio(imageSize: FalImageSize): string {
+    switch (imageSize) {
+      case 'portrait_4_3':  return '3:4'
+      case 'portrait_16_9': return '9:16'
+      case 'square_hd':     return '1:1'
+      case 'square':        return '1:1'
+      case 'landscape_4_3': return '4:3'
+      case 'landscape_16_9': return '16:9'
+      default:              return '3:4'
+    }
   }
 
   private presetToPixels(preset: FalImageSize): { width: number; height: number } {
