@@ -409,21 +409,28 @@ function detectPretendMedia(
   const hasGaps = /\n\s*\n\s*\n/.test(llmResponse)
   if (!hasGaps) return null
 
-  // --- Determine intent source: user request OR LLM sending intent ---
+  // --- Determine intent source ---
 
   // User explicitly requested media?
-  const userWantsMedia = /send|show|see|take|give|wanna|want|can (i|you)|let me|拍|发|看|给|要/.test(userLower)
-    && /photo|pic|image|selfie|video|clip|voice|audio|hear|照|图|拍|视频|语音|声音|sing|歌/.test(userLower)
+  // Broad action verbs + media nouns (English and Chinese)
+  const userHasActionVerb = /send|show|see|take|give|wanna|want|can (i|you)|let me|拍|发|看|给|要|hear|listen/.test(userLower)
+  const userHasMediaNoun = /photo|pic|image|selfie|video|clip|voice|audio|hear|照|图|拍|视频|语音|声音|sing|歌|view|风景|窗|matcha|food|setup|room/.test(userLower)
+  const userWantsMedia = userHasActionVerb && userHasMediaNoun
 
   // User following up on missing media?
   const userFollowUp = /where.*(photo|pic|image|video|clip|selfie|it)|没(有)?发|没收到|怎么没|didn't (send|attach|go)/i.test(userLower)
 
-  // LLM is strongly indicating it's sending specific media type?
+  // LLM response indicates specific media type being sent
   const llmSendsVideo = /here's.*(clip|video|recording)|quick (clip|video)|录.*(了|好)/i.test(llmLower)
   const llmSendsVoice = /here's.*(voice|audio|recording)|listen to (this|me)|hear (this|me)|说给你听|唱给你/i.test(llmLower)
+  // Note: llmSendsImage alone is NOT enough — LLM can say "here's a photo" as roleplay
+  // without the user asking for it. Only count as intent if user ALSO has a request verb.
   const llmSendsImage = /here's.*(photo|pic|selfie|shot|view)|took.*(photo|pic|shot)|拍了.*照/i.test(llmLower)
 
-  const hasIntent = userWantsMedia || userFollowUp || llmSendsVideo || llmSendsVoice || llmSendsImage
+  // For video/voice, LLM intent alone is sufficient (rare false positives)
+  // For image, require EITHER user request OR (llm intent + user has action verb)
+  const hasIntent = userWantsMedia || userFollowUp || llmSendsVideo || llmSendsVoice
+    || (llmSendsImage && userHasActionVerb)
 
   if (!hasIntent) {
     debugLog(`[Engine] Pretend-send suppressed: no media intent in user="${userMessage.slice(0, 50)}" or LLM response`)
@@ -550,6 +557,7 @@ function detectSceneRequest(userMessage: string, llmResponse: string): boolean {
     /sunset/i, /sunrise/i, /landscape/i, /scenery/i,
     /show.*room/i, /show.*setup/i, /show.*desk/i, /show.*food/i,
     /what.*eating/i, /what.*drinking/i, /what.*cooking/i,
+    /dinner/i, /lunch/i, /breakfast/i, /meal/i,
     /see.*room/i, /see.*place/i, /see.*setup/i,
     /matcha/i, /coffee.*cup/i, /food.*photo/i,
     /窗外/i, /风景/i, /看.*窗/i, /看.*外面/i,
@@ -562,9 +570,10 @@ function detectSceneRequest(userMessage: string, llmResponse: string): boolean {
     /photo.*(of|i took).*(food|meal|dish|cake|dessert|drink|matcha|coffee|tea)/i,
     /photo.*(of|i took).*(room|desk|setup|view|window|sunset|sunrise)/i,
     /here's.*(the view|my view|the sky|the sunset|the sunrise|my room|my desk|my setup)/i,
+    /here's.*(my dinner|my lunch|my breakfast|my meal|my food|my matcha|my coffee)/i,
     /flower|floral|bouquet|bloom/i,
     /farmer'?s? market/i,
-    /市场|花|风景|日落|日出|房间|桌子/i,
+    /市场|花|风景|日落|日出|房间|桌子|晚餐|午餐|早餐/i,
   ]
 
   const userLower = userMessage.toLowerCase()
