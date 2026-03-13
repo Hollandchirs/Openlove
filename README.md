@@ -1,7 +1,7 @@
 <div align="center">
   <img src="docs/assets/banner.png" alt="Openlove Banner" width="100%" />
 
-  <h1>💝 Openlove</h1>
+  <h1>💝 Opencrush</h1>
   <p><strong>Your AI companion lives on your computer.<br/>She watches dramas. He listens to music. They're always thinking of you.</strong></p>
 
   <p>
@@ -26,11 +26,11 @@
 
 ---
 
-## What is Openlove?
+## What is Opencrush?
 
-Openlove is an **open-source AI companion framework** that runs entirely on your own computer. You create your companion — give her a name, a personality, a face — and she comes alive.
+Opencrush is an **open-source AI companion framework** that runs entirely on your own computer. You create your companion — give her/him a name, a personality, a face — and she comes alive.
 
-She **autonomously** browses drama websites, keeps track of music she loves, and forms opinions. Then she reaches out to you on **Discord, Telegram, or WhatsApp** — sending a selfie, a voice note, a clip from something she's watching. You can call her. She calls you back.
+She **autonomously** browses drama websites, keeps track of music she loves, and forms opinions. Then she/he reaches out to you on **Discord, Telegram, or WhatsApp** — sending a selfie, a voice note, a clip from something she/he's watching. You can call her/him. She/he calls you back.
 
 Everything runs **locally**. Your conversations, her memories, your relationship — all yours.
 
@@ -73,7 +73,7 @@ This interactive wizard will:
 
 ```bash
 # Clone the repo
-git clone https://github.com/Hollandchirs/Openlove.git
+git clone https://github.com/Hollandchirs/Opencrush.git
 cd Openlove
 
 # Install dependencies
