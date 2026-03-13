@@ -160,10 +160,32 @@ export class VideoEngine {
       return null
     }
 
-    debugLog(`[Media/Video] Downloading: ${videoUrl.slice(0, 80)}...`)
-    const response = await fetch(videoUrl)
-    const buffer = Buffer.from(await response.arrayBuffer())
-    debugLog(`[Media/Video] Downloaded: ${buffer.length} bytes`)
-    return buffer
+    // Download with retry (fal CDN can be slow/flaky)
+    const maxRetries = 3
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        debugLog(`[Media/Video] Downloading (attempt ${attempt}): ${videoUrl.slice(0, 80)}...`)
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 30_000) // 30s timeout
+        const response = await fetch(videoUrl, { signal: controller.signal })
+        clearTimeout(timeout)
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer())
+        debugLog(`[Media/Video] Downloaded: ${buffer.length} bytes`)
+        return buffer
+      } catch (err) {
+        debugLog(`[Media/Video] Download attempt ${attempt} failed: ${err instanceof Error ? err.message : err}`)
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 2000 * attempt)) // backoff
+        }
+      }
+    }
+
+    debugLog(`[Media/Video] All ${maxRetries} download attempts failed`)
+    return null
   }
 }
