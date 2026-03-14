@@ -95,6 +95,190 @@ async function main(): Promise<void> {
       break
     }
 
+    case 'memory':
+    case 'recall':
+    case 'brain': {
+      const { existsSync, readFileSync } = await import('fs')
+      const { join } = await import('path')
+      const Database = (await import('better-sqlite3')).default
+
+      const charName = process.env.CHARACTER_NAME ?? 'helora'
+      const rootDir = process.env.INIT_CWD ?? process.cwd()
+      const charDir = join(rootDir, 'characters', charName)
+      const dbPath = join(charDir, 'memory.db')
+
+      if (!existsSync(dbPath)) {
+        console.log(chalk.red(`\n  No memory found for "${charName}". Start a conversation first.\n`))
+        break
+      }
+
+      const db = new Database(dbPath, { readonly: true })
+
+      // Recent conversations
+      console.log(chalk.magenta(`\n  🧠 ${charName}'s Memory\n`))
+      console.log(chalk.bold('  ── 💬 最近对话 ──'))
+      const msgs = db.prepare(
+        'SELECT role, content, timestamp FROM messages ORDER BY timestamp DESC LIMIT 10'
+      ).all() as Array<{ role: string; content: string; timestamp: number }>
+
+      for (const m of msgs.reverse()) {
+        const time = new Date(m.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+        const who = m.role === 'user' ? chalk.cyan('你') : chalk.magenta(charName)
+        const text = m.content.replace(/\n/g, ' ').slice(0, 80)
+        console.log(`  ${chalk.gray(time)} ${who}: ${text}`)
+      }
+
+      // Relationship
+      console.log(chalk.bold('\n  ── 💕 关系状态 ──'))
+      const rel = db.prepare("SELECT value FROM relationship WHERE key='state'").get() as { value: string } | undefined
+      if (rel) {
+        const r = JSON.parse(rel.value)
+
+        const stageLabels: Record<string, string> = {
+          stranger: '陌生人 👋', acquaintance: '认识中 🤝', friend: '朋友 😊',
+          close_friend: '密友 💛', intimate: '亲密 💕',
+        }
+        const nextStage: Record<string, { name: string; threshold: number }> = {
+          stranger: { name: '认识', threshold: 0.15 },
+          acquaintance: { name: '朋友', threshold: 0.35 },
+          friend: { name: '密友', threshold: 0.60 },
+          close_friend: { name: '亲密', threshold: 0.85 },
+        }
+
+        console.log(`  阶段: ${chalk.yellow(stageLabels[r.stage] ?? r.stage)}`)
+
+        // Progress bar to next stage
+        const next = nextStage[r.stage]
+        if (next) {
+          const currentThresholds: Record<string, number> = {
+            stranger: 0, acquaintance: 0.15, friend: 0.35, close_friend: 0.60, intimate: 0.85,
+          }
+          const cur = currentThresholds[r.stage] ?? 0
+          const progress = (r.closeness - cur) / (next.threshold - cur)
+          const barLen = 20
+          const filled = Math.round(progress * barLen)
+          const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled)
+          console.log(`  进度: [${chalk.green(bar)}] → ${next.name} (${(progress * 100).toFixed(0)}%)`)
+        }
+
+        console.log('')
+        const fmtStat = (label: string, val: number) => chalk.green((val * 100).toFixed(1) + '%')
+        console.log(`  亲密度: ${fmtStat('亲密度', r.closeness)}  信任度: ${fmtStat('信任度', r.trust)}  熟悉度: ${fmtStat('熟悉度', r.familiarity)}`)
+        console.log(`  总消息: ${r.totalMessages}  聊天天数: ${r.totalDays}  连续: ${r.currentStreak}天 (最高: ${r.longestStreak}天)`)
+
+        // Relationship history — show changes
+        try {
+          const hasHistory = db.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='relationship_history'"
+          ).get()
+
+          if (hasHistory) {
+            // Today's changes
+            const todayStart = new Date()
+            todayStart.setHours(0, 0, 0, 0)
+            const todayMs = todayStart.getTime()
+
+            const todayStats = db.prepare(`
+              SELECT
+                SUM(closeness_delta) as c_total,
+                SUM(trust_delta) as t_total,
+                SUM(familiarity_delta) as f_total,
+                COUNT(*) as interactions
+              FROM relationship_history WHERE timestamp >= ?
+            `).get(todayMs) as { c_total: number | null; t_total: number | null; f_total: number | null; interactions: number } | undefined
+
+            if (todayStats && todayStats.interactions > 0) {
+              console.log(chalk.bold('\n  ── 📈 今日变化 ──'))
+              const fmtDelta = (val: number | null) => {
+                if (!val) return chalk.gray('+0.0%')
+                const pct = (val * 100).toFixed(1)
+                return val > 0 ? chalk.green(`+${pct}%`) : chalk.red(`${pct}%`)
+              }
+              console.log(`  亲密度 ${fmtDelta(todayStats.c_total)}  信任度 ${fmtDelta(todayStats.t_total)}  熟悉度 ${fmtDelta(todayStats.f_total)}`)
+              console.log(`  今日互动: ${todayStats.interactions} 次`)
+            }
+
+            // Last 7 days daily summary
+            const weekAgo = Date.now() - 7 * 86_400_000
+            const dailyStats = db.prepare(`
+              SELECT
+                date(timestamp / 1000, 'unixepoch', 'localtime') as day,
+                SUM(closeness_delta) as c_total,
+                SUM(trust_delta) as t_total,
+                SUM(familiarity_delta) as f_total,
+                COUNT(*) as interactions
+              FROM relationship_history
+              WHERE timestamp >= ?
+              GROUP BY day
+              ORDER BY day DESC
+            `).all(weekAgo) as Array<{ day: string; c_total: number; t_total: number; f_total: number; interactions: number }>
+
+            if (dailyStats.length > 0) {
+              console.log(chalk.bold('\n  ── 📊 最近7天趋势 ──'))
+              console.log(chalk.gray('  日期         亲密度    信任度    熟悉度    互动'))
+              for (const d of dailyStats) {
+                const fmtD = (val: number) => {
+                  const pct = (val * 100).toFixed(1).padStart(5)
+                  return val > 0 ? chalk.green(`+${pct}%`) : val < 0 ? chalk.red(`${pct}%`) : chalk.gray(` ${pct}%`)
+                }
+                console.log(`  ${chalk.gray(d.day)}  ${fmtD(d.c_total)}  ${fmtD(d.t_total)}  ${fmtD(d.f_total)}   ${String(d.interactions).padStart(3)}次`)
+              }
+            }
+
+            // Recent interactions with deltas
+            const recentChanges = db.prepare(`
+              SELECT timestamp, closeness_delta, trust_delta, familiarity_delta, trigger_text, stage
+              FROM relationship_history
+              ORDER BY timestamp DESC LIMIT 5
+            `).all() as Array<{ timestamp: number; closeness_delta: number; trust_delta: number; familiarity_delta: number; trigger_text: string; stage: string }>
+
+            if (recentChanges.length > 0) {
+              console.log(chalk.bold('\n  ── 💬 最近互动影响 ──'))
+              for (const ch of recentChanges.reverse()) {
+                const time = new Date(ch.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+                const cStr = ch.closeness_delta > 0.003 ? chalk.green('♥') : chalk.gray('·')
+                const tStr = ch.trust_delta > 0.003 ? chalk.blue('★') : chalk.gray('·')
+                const fStr = ch.familiarity_delta > 0.003 ? chalk.yellow('◆') : chalk.gray('·')
+                const text = (ch.trigger_text ?? '').slice(0, 50)
+                console.log(`  ${chalk.gray(time)} ${cStr}${tStr}${fStr} "${text}"`)
+              }
+              console.log(chalk.gray('  图例: ♥=亲密度↑ ★=信任度↑ ◆=熟悉度↑ ·=微变'))
+            }
+          }
+        } catch {
+          // history table doesn't exist yet, skip
+        }
+      }
+
+      // Episodes
+      console.log(chalk.bold('\n  ── 📖 最近生活 ──'))
+      const episodes = db.prepare(
+        'SELECT type, title, timestamp FROM episodes ORDER BY timestamp DESC LIMIT 10'
+      ).all() as Array<{ type: string; title: string; timestamp: number }>
+
+      for (const e of episodes) {
+        const time = new Date(e.timestamp).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+        const icon = e.type === 'music' ? '🎵' : e.type === 'drama' ? '📺' : e.type === 'mood' ? '💭' : '📌'
+        console.log(`  ${chalk.gray(time)} ${icon} ${e.title.slice(0, 70)}`)
+      }
+
+      // Semantic memory (vector)
+      const vectorPath = join(charDir, 'vectors', 'index.json')
+      if (existsSync(vectorPath)) {
+        console.log(chalk.bold('\n  ── 🧠 长期记忆 (最近10条) ──'))
+        const vecData = JSON.parse(readFileSync(vectorPath, 'utf-8'))
+        const items = vecData.items ?? []
+        for (const item of items.slice(-10)) {
+          const text = (item.metadata?.text ?? '').replace(/\n/g, ' ').slice(0, 90)
+          console.log(`  ${chalk.gray('•')} ${text}`)
+        }
+        console.log(chalk.gray(`\n  共 ${items.length} 条向量记忆\n`))
+      }
+
+      db.close()
+      break
+    }
+
     case '--help':
     case 'help':
     case '-h': {
@@ -107,6 +291,7 @@ async function main(): Promise<void> {
     ${chalk.cyan('pnpm wakeup')}       Kill existing process + restart
     ${chalk.cyan('pnpm create-character')}   Create a new companion
     ${chalk.cyan('pnpm status')}       Show current status
+    ${chalk.cyan('opencrush memory')}  View AI's memory, relationship, and impressions
 
   ${chalk.bold('Files:')}
     ${chalk.gray('.env')}              Your API keys and settings

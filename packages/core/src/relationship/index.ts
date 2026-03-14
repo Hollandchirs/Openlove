@@ -68,6 +68,20 @@ export class RelationshipTracker {
         value TEXT NOT NULL
       );
     `)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS relationship_history (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp  INTEGER NOT NULL,
+        closeness  REAL NOT NULL,
+        trust      REAL NOT NULL,
+        familiarity REAL NOT NULL,
+        closeness_delta  REAL NOT NULL DEFAULT 0,
+        trust_delta      REAL NOT NULL DEFAULT 0,
+        familiarity_delta REAL NOT NULL DEFAULT 0,
+        trigger_text TEXT,
+        stage      TEXT NOT NULL
+      );
+    `)
   }
 
   private loadState(): RelationshipState {
@@ -188,6 +202,11 @@ export class RelationshipTracker {
       familiarityBoost += 0.008
     }
 
+    // Snapshot previous values for delta tracking
+    const prevCloseness = this.state.closeness
+    const prevTrust = this.state.trust
+    const prevFamiliarity = this.state.familiarity
+
     // Apply growth with diminishing returns (harder to get closer as you already are)
     this.state.closeness = clamp(this.state.closeness + closenessBoost * (1 - this.state.closeness * 0.5))
     this.state.trust = clamp(this.state.trust + trustBoost * (1 - this.state.trust * 0.3))
@@ -195,6 +214,24 @@ export class RelationshipTracker {
 
     // Update stage
     this.state.stage = this.resolveStage()
+
+    // Record history snapshot with deltas
+    const cDelta = this.state.closeness - prevCloseness
+    const tDelta = this.state.trust - prevTrust
+    const fDelta = this.state.familiarity - prevFamiliarity
+    const triggerPreview = userMessage.slice(0, 80)
+
+    this.db.prepare(`
+      INSERT INTO relationship_history
+        (timestamp, closeness, trust, familiarity, closeness_delta, trust_delta, familiarity_delta, trigger_text, stage)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      now,
+      this.state.closeness, this.state.trust, this.state.familiarity,
+      cDelta, tDelta, fDelta,
+      triggerPreview,
+      this.state.stage,
+    )
 
     // Persist
     this.saveState(this.state)

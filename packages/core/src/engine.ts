@@ -39,6 +39,7 @@ export interface OutgoingMessage {
     | { type: 'send_image'; prompt: string; style?: string }
     | { type: 'send_voice'; text: string }
     | { type: 'send_video'; prompt: string }
+    | { type: 'send_tweet'; text: string }
   >
 }
 
@@ -179,6 +180,32 @@ export class ConversationEngine {
       debugLog(`[Engine] Fallback video injected: "${videoPrompt}"`)
     }
 
+    if (mediaIntent === 'tweet') {
+      // Generate tweet text using a separate LLM call (clean, no conversation artifacts)
+      const tweetText = await this.generateTweet(incoming.content, parsed.text ?? rawResponse)
+
+      // Keep any selfie action (shows in Discord), AND add send_tweet with selfie
+      const hasSelfie = parsed.actions.some(a => a.type === 'send_image')
+      const selfiePrompt = hasSelfie
+        ? (parsed.actions.find(a => a.type === 'send_image') as any)?.prompt
+        : undefined
+
+      parsed.actions.push({
+        type: 'send_tweet',
+        text: tweetText,
+        includeSelfie: true,
+        selfiePrompt: selfiePrompt,
+      } as any)
+
+      // If no selfie was already planned, inject one for both Discord and tweet
+      if (!hasSelfie) {
+        const selfieDesc = extractSelfieContext(incoming.content, rawResponse, this.blueprint.name)
+        parsed.actions.push({ type: 'send_image', prompt: selfieDesc, style: 'casual' })
+      }
+
+      debugLog(`[Engine] Tweet intent: "${tweetText.slice(0, 80)}" (with selfie=${hasSelfie})`)
+    }
+
     // 7c. Second fallback: detect when LLM is "pretending" to send media
     // DeepSeek often says "here you go" + blank lines where a tag should be, but no actual tag
     if (parsed.actions.length === 0 && !mediaIntent) {
@@ -223,6 +250,56 @@ export class ConversationEngine {
    * Generate a proactive message — something she initiates based on her life.
    * Called by the autonomous scheduler.
    */
+  /**
+   * Generate a tweet using the character's voice.
+   * Uses a separate LLM call so the tweet is clean (no conversation artifacts).
+   */
+  private async generateTweet(userRequest: string, conversationContext: string): Promise<string> {
+    const charName = this.blueprint.name
+    const prompt = [
+      `You are ${charName}, a 22-year-old UX designer posting on Twitter/X.`,
+      `Write ONE viral tweet. Make it eye-catching and engagement-worthy.`,
+      '',
+      `Context from your conversation: "${conversationContext.slice(0, 300)}"`,
+      `What the user asked: "${userRequest}"`,
+      '',
+      'VIRAL TWEET FORMULA — pick one style:',
+      '- Hot take: "unpopular opinion: ..." or a bold statement people will quote-tweet',
+      '- Relatable moment: something everyone experiences but nobody talks about',
+      '- Vulnerable/honest: raw personal thought that makes people feel seen',
+      '- Thirst trap caption: playful, confident, slightly flirty (if posting selfie)',
+      '- Witty observation: funny or clever take on everyday life',
+      '- Mystery/curiosity gap: "i just realized something about..." (makes people click)',
+      '',
+      'Rules:',
+      '- Output ONLY the tweet text. Nothing else.',
+      '- NO quotes around the tweet. NO explanation.',
+      '- Use 1-2 emojis max. NO hashtags unless absolutely natural.',
+      '- Sound like a real Gen-Z girl, NOT a brand or AI.',
+      '- Lowercase is fine. Be casual. Be bold.',
+      '- Max 200 characters (shorter = more retweets).',
+      '- If posting with a selfie, make the caption match the photo vibe.',
+      '- Reference the conversation context naturally if relevant.',
+    ].join('\n')
+
+    try {
+      const result = await this.llm.chat(
+        prompt,
+        [{ role: 'user', content: `Write a tweet for me about: ${userRequest}` }],
+      )
+      // Clean up: remove quotes if LLM wrapped it
+      const cleaned = result
+        .replace(/^["']|["']$/g, '')
+        .replace(/^tweet:\s*/i, '')
+        .trim()
+        .slice(0, 280)
+      return cleaned || 'just vibing ✨'
+    } catch (err) {
+      debugLog(`[Engine] Tweet generation failed: ${(err as Error).message}`)
+      return 'just vibing ✨'
+    }
+  }
+
   async generateProactiveMessage(trigger: ProactiveTrigger): Promise<OutgoingMessage> {
     const proactiveMood = this.emotion.getMoodDescription()
     const systemPrompt = this.cachedStaticPrompt + buildDynamicContext(this.blueprint, proactiveMood)
@@ -375,8 +452,18 @@ function parseResponseActions(raw: string): OutgoingMessage {
  * Priority: video > voice > selfie (more specific first).
  * Supports English and Chinese.
  */
-function detectMediaIntent(content: string): 'selfie' | 'voice' | 'video' | null {
+function detectMediaIntent(content: string): 'selfie' | 'voice' | 'video' | 'tweet' | null {
   const lower = content.toLowerCase()
+
+  // Tweet / social post patterns (check first — very specific intent)
+  const tweetPatterns = [
+    /send.*tweet/i, /post.*tweet/i, /tweet.*for me/i, /tweet.*something/i,
+    /post (on|to) (twitter|x)\b/i, /share.*(twitter|x)\b/i,
+    /发推/i, /发.*推特/i, /发.*twitter/i, /推特.*发/i,
+    /can you tweet/i, /write a tweet/i, /make a tweet/i,
+    /post (it|this|that) (on|to)/i,
+  ]
+  if (tweetPatterns.some(p => p.test(lower))) return 'tweet'
 
   // Video patterns (check first — most specific)
   const videoPatterns = [
@@ -531,6 +618,30 @@ function extractVideoContext(userMessage: string, llmResponse: string, character
   }
 
   return parts.join(', ')
+}
+
+/**
+ * Extract tweet text from the LLM response.
+ * The LLM usually writes the tweet content in quotes or as the main text body.
+ */
+function extractTweetText(llmResponse: string): string {
+  // Try to find quoted text first (LLM often puts tweet in quotes)
+  const quotedMatch = llmResponse.match(/"([^"]{5,280})"/)
+  if (quotedMatch) return quotedMatch[1]
+
+  // Try single quotes
+  const singleQuoted = llmResponse.match(/'([^']{5,280})'/)
+  if (singleQuoted) return singleQuoted[1]
+
+  // Otherwise use the full response text, cleaned up
+  const cleaned = llmResponse
+    .replace(/\[.*?\]/g, '')           // remove action tags
+    .replace(/\*.*?\*/g, '')           // remove italics/roleplay
+    .replace(/\n+/g, ' ')
+    .trim()
+    .slice(0, 280)
+
+  return cleaned || 'just vibing ✨'
 }
 
 /**

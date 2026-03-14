@@ -504,7 +504,16 @@ export class DiscordBridge {
     debugLog(`[Discord] Response has ${response.actions?.length ?? 0} action(s), text length: ${response.text.length}`)
     if (response.actions && response.actions.length > 0) {
       debugLog(`[Discord] Processing ${response.actions.length} action(s): ${JSON.stringify(response.actions.map(a => a.type))}`)
-      for (const action of response.actions) {
+      // Track last generated media so send_tweet can reuse it (no duplicate generation)
+      let lastGeneratedImageBuffer: Buffer | null = null
+      let lastGeneratedVideoBuffer: Buffer | null = null
+      // Sort: process media actions first, then tweet (so tweet can reuse generated media)
+      const sortedActions = [...response.actions].sort((a, b) => {
+        if (a.type === 'send_tweet') return 1
+        if (b.type === 'send_tweet') return -1
+        return 0
+      })
+      for (const action of sortedActions) {
         await new Promise(r => setTimeout(r, 1000))
 
         try {
@@ -520,6 +529,7 @@ export class DiscordBridge {
             action.style
           )
           if (imageBuffer) {
+            lastGeneratedImageBuffer = imageBuffer
             debugLog(`[Discord] Image generated: ${imageBuffer.length} bytes, sending to Discord...`)
             const attachment = new AttachmentBuilder(imageBuffer, { name: 'photo.jpg' })
             await channel.send({ files: [attachment] })
@@ -556,12 +566,55 @@ export class DiscordBridge {
             clearInterval(typingInterval)
           }
           if (videoBuffer) {
+            lastGeneratedVideoBuffer = videoBuffer
             debugLog(`[Discord] Video generated: ${videoBuffer.length} bytes, sending to Discord...`)
             const attachment = new AttachmentBuilder(videoBuffer, { name: 'video.mp4' })
             await channel.send({ files: [attachment] })
             debugLog(`[Discord] Video sent successfully`)
           } else {
             debugLog(`[Discord] Video generation returned null — check FAL_KEY and API status`)
+          }
+        }
+
+        if (action.type === 'send_tweet') {
+          const tweetAction = action as any
+          // Reuse already-generated image/video from earlier actions (no duplicate API calls)
+          const mediaBuffer = lastGeneratedImageBuffer ?? lastGeneratedVideoBuffer ?? undefined
+          const mediaType = lastGeneratedImageBuffer ? 'image' as const
+            : lastGeneratedVideoBuffer ? 'video' as const
+            : undefined
+          debugLog(`[Discord] Posting tweet: "${tweetAction.text.slice(0, 80)}" (media=${mediaType ?? 'none'}, ${mediaBuffer?.length ?? 0} bytes)`)
+          try {
+            const { SocialEngine } = await import('@opencrush/autonomous')
+            const { join } = await import('path')
+            const rootDir = process.env.INIT_CWD ?? process.cwd()
+            const socialEngine = new SocialEngine({
+              twitter: {
+                clientId: process.env.TWITTER_OAUTH2_CLIENT_ID ?? process.env.TWITTER_CLIENT_ID ?? '',
+                clientSecret: process.env.TWITTER_OAUTH2_CLIENT_SECRET ?? process.env.TWITTER_CLIENT_SECRET ?? '',
+                oauth2TokenFile: join(rootDir, '.twitter-oauth2-tokens.json'),
+              },
+            })
+            await socialEngine.initialize()
+            debugLog(`[Discord] SocialEngine initialized: ready=${socialEngine.isReady()}`)
+
+            const results = await socialEngine.post(tweetAction.text, {
+              mediaBuffer: mediaBuffer ?? undefined,
+              mediaType,
+            })
+            const success = results.some((r: any) => r.success)
+            if (success) {
+              debugLog(`[Discord] Tweet posted successfully`)
+              const mediaLabel = mediaType === 'image' ? ' with selfie' : mediaType === 'video' ? ' with video' : ''
+              await channel.send(`✅ tweeted${mediaLabel}: "${tweetAction.text}"`)
+            } else {
+              const errors = results.map((r: any) => r.error).filter(Boolean).join('; ')
+              debugLog(`[Discord] Tweet failed: ${errors}`)
+              await channel.send(`❌ tweet failed: ${errors || 'unknown error'}`)
+            }
+          } catch (err) {
+            debugLog(`[Discord] Tweet error: ${err instanceof Error ? err.message : err}`)
+            await channel.send(`❌ couldn't post tweet: ${err instanceof Error ? err.message : 'error'}`)
           }
         }
         } catch (err) {

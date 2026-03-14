@@ -236,8 +236,23 @@ export class AutonomousScheduler {
    */
   private async maybeSocialPost(): Promise<void> {
     if (this.isQuietHours()) return
-    if (!this.config.socialEngine?.isReady()) return
+    if (!this.config.socialEngine) return
     if (!this.config.mediaEngine) return
+
+    // Retry initialization if not ready (e.g., VPN was off at startup)
+    if (!this.config.socialEngine.isReady()) {
+      console.log('[Autonomous] Social engine not ready — retrying initialization...')
+      try {
+        await this.config.socialEngine.initialize()
+      } catch (err) {
+        console.warn('[Autonomous] Social engine re-init failed:', (err as Error).message)
+      }
+      if (!this.config.socialEngine.isReady()) {
+        console.log('[Autonomous] Social engine still not ready — skipping post')
+        return
+      }
+      console.log('[Autonomous] Social engine re-initialized successfully!')
+    }
 
     // 70% chance per window (7 windows × 0.7 = ~4.9 posts/day)
     if (Math.random() > 0.70) {

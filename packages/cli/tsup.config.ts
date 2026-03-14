@@ -6,5 +6,5 @@ export default defineConfig({
   outExtension: () => ({ js: '.js' }),
   clean: true,
   // openai is optional — only needed if user picks OpenAI provider
-  external: ['openai'],
+  external: ['openai', 'better-sqlite3'],
 })

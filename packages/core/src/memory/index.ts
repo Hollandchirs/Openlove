@@ -12,7 +12,7 @@
 import Database from 'better-sqlite3'
 import { LocalIndex } from 'vectra'
 import { join } from 'path'
-import { mkdirSync, existsSync } from 'fs'
+import { mkdirSync, existsSync, writeFileSync, readFileSync } from 'fs'
 
 export interface Message {
   role: 'user' | 'assistant'
@@ -47,6 +47,12 @@ export class MemorySystem {
   private conversationSummary: string = ''
   /** Message ID up to which the summary covers */
   private summaryUpToId: number = 0
+  /** Path to character data directory */
+  private charDir: string
+  /** Counter for consolidate calls — triggers MEMORY.md sync every N calls */
+  private consolidateCount: number = 0
+  /** How often to sync MEMORY.md (every N consolidate calls) */
+  private readonly SYNC_INTERVAL = 10
 
   constructor(
     characterName: string,
@@ -57,9 +63,10 @@ export class MemorySystem {
     this.characterName = characterName
     this.embedFn = embedFn
     this.summarizeFn = summarizeFn
+    this.charDir = join(dataDir, characterName)
 
-    const dbPath = join(dataDir, characterName, 'memory.db')
-    const vectorPath = join(dataDir, characterName, 'vectors')
+    const dbPath = join(this.charDir, 'memory.db')
+    const vectorPath = join(this.charDir, 'vectors')
 
     mkdirSync(join(dataDir, characterName), { recursive: true })
     mkdirSync(vectorPath, { recursive: true })
@@ -282,6 +289,18 @@ export class MemorySystem {
       const exchange = `User said: "${userMessage}" — Response: "${assistantResponse.slice(0, 200)}"`
       await this.addToSemanticMemory(exchange, { timestamp: now })
     }
+
+    // Periodically sync MEMORY.md with accumulated knowledge
+    this.consolidateCount++
+    if (this.consolidateCount % this.SYNC_INTERVAL === 0) {
+      // Fire-and-forget both syncs in parallel
+      Promise.all([
+        this.syncMemoryFile(),
+        this.syncUserFile(),
+      ]).catch(err =>
+        console.warn('[Memory] File sync failed:', (err as Error).message)
+      )
+    }
   }
 
   getMoodContext(): string {
@@ -291,6 +310,148 @@ export class MemorySystem {
     const latest = recentEpisodes[0]
     if (latest.type === 'mood') return latest.title
     return ''
+  }
+
+  /**
+   * Sync MEMORY.md with accumulated knowledge from the database.
+   * Uses LLM to extract key facts from recent conversations + episodes,
+   * then writes a structured markdown file the AI reads at startup.
+   */
+  async syncMemoryFile(): Promise<void> {
+    if (!this.summarizeFn) return
+
+    const memoryPath = join(this.charDir, 'MEMORY.md')
+
+    // Gather data from all memory layers
+    const recentMessages = this.getRecentMessages(30)
+    const recentEpisodes = this.getRecentEpisodes(20)
+
+    // Build transcript for LLM analysis
+    const transcript = recentMessages
+      .map(m => `${m.role}: ${m.content.slice(0, 200)}`)
+      .join('\n')
+
+    const episodeList = recentEpisodes
+      .map(e => `[${e.type}] ${e.title}: ${e.description}`)
+      .join('\n')
+
+    // Read existing MEMORY.md to preserve manually-added notes
+    let existingMemory = ''
+    if (existsSync(memoryPath)) {
+      existingMemory = readFileSync(memoryPath, 'utf-8')
+    }
+
+    const prompt = `You are updating a character's memory file based on recent conversations and activities.
+
+EXISTING MEMORY FILE:
+${existingMemory}
+
+RECENT CONVERSATIONS:
+${transcript}
+
+RECENT LIFE EVENTS:
+${episodeList}
+
+Write an updated MEMORY.md with these sections. Keep ALL existing facts and add new ones discovered from the conversations. Remove placeholder text like "[add your own]". Be specific — use real names, preferences, and details mentioned in conversation.
+
+FORMAT (use exactly this structure):
+## Things She Knows About You
+- (bullet points of facts about the user: name, timezone, preferences, personal details, habits)
+
+## Her Current Obsessions
+Watching: (specific shows from episodes)
+Listening to: (specific songs/artists from episodes)
+Browsing: (websites she's been visiting)
+
+## Conversation Highlights
+- (memorable moments, jokes, emotional exchanges from recent chats)
+
+## Notes to Self
+- (character's personal thoughts, goals, feelings mentioned in conversation)
+
+RULES:
+- Keep it concise — max 25 bullet points total
+- Only include FACTS actually mentioned in conversations or episodes
+- Do NOT invent or hallucinate facts
+- Use casual, first-person voice (as if the character is writing notes to herself)
+- If existing memory has real facts, KEEP them. Only remove placeholder text.`
+
+    const newContent = await this.summarizeFn(prompt)
+    if (newContent && newContent.length > 50) {
+      writeFileSync(memoryPath, newContent.trim() + '\n', 'utf-8')
+      console.log('[Memory] MEMORY.md synced with latest knowledge')
+    }
+  }
+
+  /**
+   * Sync USER.md with accumulated knowledge about the user.
+   * Extracts personal facts, preferences, and relationship dynamics
+   * from recent conversations and writes them to USER.md.
+   */
+  async syncUserFile(): Promise<void> {
+    if (!this.summarizeFn) return
+
+    const userPath = join(this.charDir, 'USER.md')
+
+    const recentMessages = this.getRecentMessages(30)
+    const transcript = recentMessages
+      .map(m => `${m.role}: ${m.content.slice(0, 200)}`)
+      .join('\n')
+
+    let existingUser = ''
+    if (existsSync(userPath)) {
+      existingUser = readFileSync(userPath, 'utf-8')
+    }
+
+    // Get relationship data
+    let relationshipInfo = ''
+    try {
+      const row = this.db.prepare("SELECT value FROM relationship WHERE key='state'").get() as { value: string } | undefined
+      if (row) {
+        const r = JSON.parse(row.value)
+        relationshipInfo = `Relationship stage: ${r.stage}, closeness: ${(r.closeness * 100).toFixed(0)}%, trust: ${(r.trust * 100).toFixed(0)}%, ${r.totalMessages} total messages over ${r.totalDays} days, streak: ${r.currentStreak} days`
+      }
+    } catch { /* ignore */ }
+
+    const prompt = `You are updating the USER.md file for an AI companion character. This file contains what the character knows about the user.
+
+EXISTING USER FILE:
+${existingUser}
+
+RECENT CONVERSATIONS:
+${transcript}
+
+RELATIONSHIP DATA:
+${relationshipInfo}
+
+Write an updated USER.md with these sections. Keep existing real facts and add new discoveries. Replace placeholders with real info.
+
+FORMAT (use exactly this structure):
+## How We Met
+(brief origin story — keep existing if it's not a placeholder, otherwise write based on conversation context)
+
+## Our Dynamic
+(describe the current relationship vibe based on actual conversations — formal? teasing? flirty? close friends?)
+
+## Things She Knows About You
+- (bullet points: timezone, habits, preferences, job, hobbies, personal details ACTUALLY mentioned)
+- (include language preference if apparent)
+
+## Recent History
+- (key recent interactions, memorable moments, arguments, jokes)
+
+RULES:
+- ONLY include facts ACTUALLY mentioned or clearly implied in conversations
+- Do NOT invent facts. If unsure, don't include it.
+- Replace generic placeholders ("[something personal]", "strong opinions about food") with real data or remove them
+- Keep it concise — max 20 bullet points total
+- Write from the character's perspective (casual, warm)`
+
+    const newContent = await this.summarizeFn(prompt)
+    if (newContent && newContent.length > 50) {
+      writeFileSync(userPath, newContent.trim() + '\n', 'utf-8')
+      console.log('[Memory] USER.md synced with latest knowledge')
+    }
   }
 }
 

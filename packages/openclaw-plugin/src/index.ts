@@ -100,6 +100,9 @@ const plugin = {
     // ── 6. Browser Tools (browse URLs, take screenshots) ────────────────
     registerBrowserTools(api, config)
 
+    // ── 7. Social Posting Tool (tweet from chat) ────────────────────────
+    registerSocialPostTool(api, config)
+
     log('Plugin registered')
     log(`Character: ${config.characterName ?? '(default)'}`)
   },
@@ -132,6 +135,14 @@ function registerCompanionTools(api: OpenClawPluginApi, config: Record<string, a
     },
     async execute(_toolCallId: string, params: unknown) {
       const p = params as Record<string, any>
+
+      // Rate limit: prevent selfie spam
+      const now = Date.now()
+      if (now - lastSelfieTime < SELFIE_COOLDOWN_MS) {
+        const waitSec = Math.ceil((SELFIE_COOLDOWN_MS - (now - lastSelfieTime)) / 1000)
+        return toolResult(`Camera needs a moment to cool down — try again in ${waitSec}s. Just reply with text for now.`)
+      }
+
       try {
         const { ImageEngine } = await import('@opencrush/media')
         const engine = new ImageEngine({
@@ -149,6 +160,7 @@ function registerCompanionTools(api: OpenClawPluginApi, config: Record<string, a
         })
         if (!buffer) return toolResult('Camera unavailable right now — no FAL_KEY configured.')
 
+        lastSelfieTime = Date.now()
         const path = join(tmpdir(), `opencrush-selfie-${Date.now()}.jpg`)
         writeFileSync(path, buffer)
 
@@ -273,6 +285,8 @@ function registerCharacterHook(api: OpenClawPluginApi, config: Record<string, an
 // Shared state for cross-function access
 let activityManagerInstance: import('@opencrush/autonomous').ActivityManager | null = null
 let browserAgentInstance: import('@opencrush/autonomous').BrowserAgent | null = null
+let lastSelfieTime = 0
+const SELFIE_COOLDOWN_MS = 3 * 60 * 1000 // 3 min cooldown between selfies
 let pendingActivityPrompt: string | null = null
 
 /**
@@ -583,6 +597,79 @@ async function getOrCreateBrowserAgent(
   }
 }
 
+// ── 7. Social Post Tool ──────────────────────────────────────────────────────
+
+function registerSocialPostTool(api: OpenClawPluginApi, config: Record<string, any>): void {
+  api.registerTool({
+    name: 'opencrush_post_tweet',
+    label: 'Post Tweet',
+    description: 'Post a tweet to Twitter/X. Use when: the user asks you to tweet, post something, share on Twitter. Pass the tweet text. Optionally attach a selfie by setting include_selfie to true.',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'The tweet text (max 280 chars)' },
+        include_selfie: { type: 'boolean', description: 'Attach a selfie photo to the tweet (default false)' },
+        selfie_description: { type: 'string', description: 'If include_selfie=true, describe the selfie scene' },
+      },
+      required: ['text'],
+    },
+    async execute(_toolCallId: string, params: unknown) {
+      const p = params as Record<string, any>
+      const tweetText = String(p.text).slice(0, 280)
+
+      try {
+        const { SocialEngine } = await import('@opencrush/autonomous')
+        const socialEngine = new SocialEngine({
+          twitterOAuth2ClientId: process.env.TWITTER_OAUTH2_CLIENT_ID ?? '',
+          twitterOAuth2ClientSecret: process.env.TWITTER_OAUTH2_CLIENT_SECRET ?? '',
+        })
+
+        let mediaBuffer: Buffer | undefined
+        let mediaType: 'image' | 'video' | undefined
+
+        // Generate selfie if requested
+        if (p.include_selfie) {
+          try {
+            const { ImageEngine } = await import('@opencrush/media')
+            const imgEngine = new ImageEngine({
+              falKey: config.falKey ?? process.env.FAL_KEY,
+              model: process.env.IMAGE_MODEL ?? 'fal-ai/flux-realism',
+            })
+            const timeCtx = getTimeContext(config)
+            const desc = p.selfie_description ?? 'casual selfie'
+            const buf = await imgEngine.generateSelfie({
+              prompt: `${desc}, ${timeCtx}`,
+              style: 'casual',
+              referenceImagePath: findReferenceImage(config),
+            })
+            if (buf) {
+              mediaBuffer = buf
+              mediaType = 'image'
+              archiveMedia(config, buf, 'tweet_selfie', 'jpg')
+            }
+          } catch (err) {
+            console.warn('[Openclaw/Tweet] Selfie generation failed:', (err as Error).message)
+          }
+        }
+
+        const results = await socialEngine.post(tweetText, {
+          mediaBuffer,
+          mediaType,
+        })
+
+        const success = results.some(r => r.success)
+        if (success) {
+          return toolResult(`Tweet posted! "${tweetText}"${mediaBuffer ? ' (with selfie)' : ''}`)
+        }
+        const errors = results.map(r => r.error).filter(Boolean).join('; ')
+        return toolResult(`Tweet failed: ${errors || 'unknown error'}`)
+      } catch (err) {
+        return toolResult(`Tweet failed: ${(err as Error).message}`)
+      }
+    },
+  })
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function buildActivityState(p: Record<string, any>): import('@opencrush/autonomous').ActivityState {
@@ -653,6 +740,7 @@ function loadCharacterBlueprint(config: Record<string, any>): string | null {
       '| video, clip, film, record, 视频, 录像 | `opencrush_record_video` |',
       '| URL/link shared, "check this", "open this", "look at this", 打开, 看看这个 | `opencrush_browse_url` |',
       '| "what are you looking at", "show me your screen", 截图 | `opencrush_screenshot` |',
+      '| tweet, post, share on twitter, 发推, 发推特 | `opencrush_post_tweet` |',
       '',
       '### Rules:',
       '- **DO NOT send selfies/photos/videos unless the user EXPLICITLY asks for one.** Normal conversation = text only. No exceptions.',
