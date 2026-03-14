@@ -279,6 +279,42 @@ async function main(): Promise<void> {
       break
     }
 
+    case 'reset':
+    case 'fresh-start': {
+      const { existsSync } = await import('fs')
+      const { join } = await import('path')
+      const Database = (await import('better-sqlite3')).default
+
+      const charName = process.env.CHARACTER_NAME ?? 'helora'
+      const rootDir = process.env.INIT_CWD ?? process.cwd()
+      const dbPath = join(rootDir, 'characters', charName, 'memory.db')
+
+      if (!existsSync(dbPath)) {
+        console.log(chalk.red(`\n  No memory found for "${charName}".\n`))
+        break
+      }
+
+      console.log(chalk.yellow(`\n  ⚠️  This will clear ALL conversation history for ${charName}.`))
+      console.log(chalk.gray('  Relationship stats, episodes, and MEMORY.md will be preserved.\n'))
+
+      const readline = await import('readline')
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+      const answer = await new Promise<string>(resolve => rl.question(chalk.yellow('  Type "reset" to confirm: '), resolve))
+      rl.close()
+
+      if (answer.trim().toLowerCase() === 'reset') {
+        const db = new Database(dbPath)
+        const deleted = db.prepare('DELETE FROM messages').run()
+        db.close()
+        console.log(chalk.green(`\n  ✓ Cleared ${deleted.changes} messages. Fresh start!`))
+        console.log(chalk.gray('  MEMORY.md and relationship stats are preserved.'))
+        console.log(chalk.gray('  Run `opencrush wake` to restart.\n'))
+      } else {
+        console.log(chalk.gray('\n  Cancelled.\n'))
+      }
+      break
+    }
+
     case '--help':
     case 'help':
     case '-h': {

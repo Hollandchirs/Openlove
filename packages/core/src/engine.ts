@@ -7,7 +7,7 @@
 
 import { Blueprint, buildStaticSystemPrompt, buildDynamicContext, buildSystemPrompt, loadBlueprint } from './blueprint/index.js'
 import { MemorySystem, Message } from './memory/index.js'
-import { LLMRouter, LLMConfig, ChatMessage } from './llm/index.js'
+import { LLMRouter, LLMConfig, ChatMessage, ImageContent } from './llm/index.js'
 import { EmotionEngine } from './emotion/index.js'
 import { RelationshipTracker } from './relationship/index.js'
 import { join } from 'path'
@@ -24,13 +24,24 @@ export interface EngineConfig {
   characterName: string
   charactersDir: string
   llm: LLMConfig
+  /** Optional callback to get the AI's current real activity (from ActivityManager).
+   *  Returns a human-readable string like "scrolling Pinterest" or "listening to Cruel Summer by Taylor Swift".
+   *  When provided, this is injected into the system prompt so the AI never contradicts its real activity. */
+  activityProvider?: () => string | null
 }
 
 export interface IncomingMessage {
   content: string
   platform: string
   userId: string
-  attachments?: Array<{ type: 'image' | 'audio' | 'video'; url: string }>
+  attachments?: Array<{
+    type: 'image' | 'audio' | 'video'
+    url: string
+    /** Base64-encoded data (for vision — downloaded by the bridge) */
+    base64?: string
+    /** MIME type (e.g., 'image/jpeg') */
+    mediaType?: string
+  }>
 }
 
 export interface OutgoingMessage {
@@ -40,6 +51,7 @@ export interface OutgoingMessage {
     | { type: 'send_voice'; text: string }
     | { type: 'send_video'; prompt: string }
     | { type: 'send_tweet'; text: string }
+    | { type: 'send_screenshot'; filePath: string; caption?: string }
   >
 }
 
@@ -67,7 +79,7 @@ export class ConversationEngine {
       (text) => this.llm.embed(text),
       (text) => this.llm.generate(text, 'Summarize the conversation concisely. Keep key facts, names, emotions, and topics. 2-3 sentences max.')
     )
-    this.relationship = new RelationshipTracker(this.memory.getDatabase())
+    this.relationship = new RelationshipTracker(this.memory.getDatabase(), this.blueprint.meta.evilMode)
   }
 
   get characterName(): string {
@@ -76,6 +88,11 @@ export class ConversationEngine {
 
   get characterBlueprint(): Blueprint {
     return this.blueprint
+  }
+
+  /** Wire up real-time activity provider (call after ActivityManager is created) */
+  setActivityProvider(provider: () => string | null): void {
+    this.config.activityProvider = provider
   }
 
   /**
@@ -100,10 +117,27 @@ export class ConversationEngine {
     const context = await this.memory.getContext(incoming.content)
     const currentMood = this.emotion.getMoodDescription()
 
-    // 2. Build system prompt: cached static + dynamic context (time, mood, relationship)
+    // 2. Build system prompt: cached static + dynamic context (time, mood, relationship, activity)
     const dynamicContext = buildDynamicContext(this.blueprint, currentMood)
     const relationshipContext = `\n- **Your relationship:** ${this.relationship.getRelationshipContext()}`
-    const systemPrompt = this.cachedStaticPrompt + dynamicContext + relationshipContext
+
+    // Inject real current activity so the AI never contradicts what it's actually doing
+    let activityContext = ''
+    if (this.config.activityProvider) {
+      const realActivity = this.config.activityProvider()
+      if (realActivity) {
+        activityContext = [
+          '\n\n## Your REAL Current Activity (CRITICAL — DO NOT CONTRADICT)',
+          `You are currently: **${realActivity}**`,
+          '- When the user asks "what are you doing?", your answer MUST match this activity.',
+          '- NEVER say you are doing something different from what is listed above.',
+          '- You can describe this activity naturally in your own words, but the core activity must match.',
+          `- Example: if your activity is "scrolling Pinterest", do NOT say "listening to music" or "watching Netflix".`,
+        ].join('\n')
+      }
+    }
+
+    const systemPrompt = this.cachedStaticPrompt + dynamicContext + relationshipContext + activityContext
 
     // 3. Assemble conversation history for LLM
     const historyMessages: ChatMessage[] = context.recentMessages.map(m => ({
@@ -134,10 +168,24 @@ export class ConversationEngine {
 
     const fullSystemPrompt = systemPrompt + episodeContext + semanticContext
 
-    // 6. Call LLM (pass static prompt length for Anthropic prompt caching)
+    // 6. Build the user message with optional image attachments
+    const userMsg: ChatMessage = { role: 'user', content: enrichedUserMessage }
+    if (incoming.attachments && incoming.attachments.length > 0) {
+      const imageAttachments = incoming.attachments.filter(a => a.type === 'image')
+      if (imageAttachments.length > 0) {
+        userMsg.images = imageAttachments.map(a => ({
+          type: 'image' as const,
+          base64: a.base64 ?? '',
+          mediaType: (a.mediaType as ImageContent['mediaType']) ?? 'image/jpeg',
+        })).filter(img => img.base64.length > 0)
+        debugLog(`[Engine] Message includes ${userMsg.images.length} image(s) for vision`)
+      }
+    }
+
+    // Call LLM (pass static prompt length for Anthropic prompt caching)
     const rawResponse = await this.llm.chat(
       fullSystemPrompt,
-      [...historyMessages, { role: 'user', content: enrichedUserMessage }],
+      [...historyMessages, userMsg],
       { staticPromptBreakpoint: this.cachedStaticPrompt.length }
     )
 

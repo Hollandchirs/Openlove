@@ -162,6 +162,9 @@ export async function startOpencrush(): Promise<void> {
   // ── Initialize activity manager ────────────────────────────────────────
   const activityManager = new ActivityManager()
 
+  // Wire activity state into engine so the AI never contradicts its real activity
+  engine.setActivityProvider(() => activityManager.describeCurrentActivity())
+
   // Browser agent (optional — requires Playwright, disabled by default)
   // Modes: 'cdp' (connect to user's Chrome), 'persistent' (saved profile), 'fresh' (isolated)
   let browserAgent: BrowserAgent | undefined

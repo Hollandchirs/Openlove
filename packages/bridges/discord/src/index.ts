@@ -163,10 +163,89 @@ export class DiscordBridge {
         break
 
       case 'idle':
-      default:
-        this.setDefaultPresence()
-        console.log(`[Discord] Presence → Idle (being ${this.config.engine.characterBlueprint.name})`)
+      default: {
+        // Generate contextual mood/thought from conversation + activity context
+        const idleLabel = activity.type === 'idle' ? (activity as any).label : undefined
+        this.generateContextualStatus(idleLabel).then(statusText => {
+          if (!this.client.user) return
+          this.client.user.setPresence({
+            activities: [{ name: statusText, type: ActivityType.Custom }],
+            status: 'online',
+          })
+          console.log(`[Discord] Presence → ${statusText}`)
+        }).catch(() => {
+          // Fallback if LLM fails
+          const fallback = idleLabel ?? 'vibing'
+          this.client.user?.setPresence({
+            activities: [{ name: fallback, type: ActivityType.Custom }],
+            status: 'online',
+          })
+        })
         break
+      }
+    }
+  }
+
+  /**
+   * Generate a contextual mood/status using LLM + memory + recent activity.
+   * Feels like a real person's Discord status that reflects what they've been doing.
+   */
+  private async generateContextualStatus(idleLabel?: string): Promise<string> {
+    try {
+      const engine = this.config.engine
+      const charName = engine.characterBlueprint.name
+
+      // Gather context from memory
+      let recentConvoSnippet = ''
+      let recentEpisodes = ''
+      try {
+        const memCtx = await engine.getMemory().getContext('status update')
+        recentConvoSnippet = memCtx.recentMessages
+          .filter((m: any) => m.role === 'user')
+          .slice(-3)
+          .map((m: any) => m.content)
+          .join('; ')
+          .slice(0, 200)
+        recentEpisodes = memCtx.relevantEpisodes
+          .slice(-3)
+          .map((e: any) => e.title ?? e.description)
+          .join('; ')
+          .slice(0, 200)
+      } catch { /* memory may not be available */ }
+
+      const prompt = [
+        `You are ${charName}. Write a short Discord custom status (max 40 chars).`,
+        `It should reflect your current mood or a passing thought based on what you've been doing.`,
+        '',
+        idleLabel ? `Current vibe: ${idleLabel}` : '',
+        recentEpisodes ? `Recent activities: ${recentEpisodes}` : '',
+        recentConvoSnippet ? `Recent chat topics: ${recentConvoSnippet}` : '',
+        '',
+        'Rules:',
+        '- Output ONLY the status text. Nothing else.',
+        '- Max 40 characters. Short and punchy.',
+        '- Sound like a real Gen-Z girl\'s Discord status.',
+        '- Can reference what you just did, how you feel, or a random thought.',
+        '- Lowercase is fine. Be natural.',
+        '- NO quotes. NO explanation. NO hashtags.',
+        '- Examples: "still thinking about that scene", "post-kdrama depression", "why did i stay up this late", "that song is stuck in my head"',
+      ].filter(Boolean).join('\n')
+
+      const result = await (engine as any).llm.chat(
+        prompt,
+        [{ role: 'user', content: 'Write my Discord status right now.' }]
+      )
+
+      // Clean: remove quotes, trim, enforce 40 char limit
+      const cleaned = result
+        .replace(/^[\"']+|[\"']+$/g, '')
+        .replace(/\n/g, ' ')
+        .trim()
+        .slice(0, 40)
+
+      return cleaned || idleLabel || 'vibing'
+    } catch {
+      return idleLabel || 'vibing'
     }
   }
 
@@ -190,7 +269,37 @@ export class DiscordBridge {
 
     // Clean the message content (remove mention prefix)
     const content = msg.content.replace(/<@!?\d+>/g, '').trim()
-    if (!content) return
+
+    // Download image attachments for vision/multimodal (max 5MB per image, max 3 images)
+    const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+    const MAX_IMAGES = 3
+    const imageAttachments: Array<{ type: 'image'; url: string; base64: string; mediaType: string }> = []
+    for (const att of msg.attachments.values()) {
+      if (imageAttachments.length >= MAX_IMAGES) break
+      if (!att.contentType?.startsWith('image/')) continue
+      if (att.size > MAX_IMAGE_BYTES) {
+        debugLog(`[Discord] Skipping oversized image: ${att.filename} (${(att.size / 1024 / 1024).toFixed(1)} MB > 5 MB limit)`)
+        continue
+      }
+      try {
+        const resp = await fetch(att.url)
+        if (resp.ok) {
+          const buf = Buffer.from(await resp.arrayBuffer())
+          imageAttachments.push({
+            type: 'image',
+            url: att.url,
+            base64: buf.toString('base64'),
+            mediaType: att.contentType ?? 'image/jpeg',
+          })
+          debugLog(`[Discord] Downloaded image attachment: ${att.filename} (${(buf.length / 1024).toFixed(1)} KB)`)
+        }
+      } catch (err) {
+        debugLog(`[Discord] Failed to download attachment ${att.filename}: ${err}`)
+      }
+    }
+
+    // Need either text or images
+    if (!content && imageAttachments.length === 0) return
 
     // Per-user lock: prevent processing a new message while still responding to the previous one
     const userId = msg.author.id
@@ -205,9 +314,10 @@ export class DiscordBridge {
 
     try {
       const response = await this.config.engine.respond({
-        content,
+        content: content || '(sent an image)',
         platform: 'discord',
         userId,
+        attachments: imageAttachments.length > 0 ? imageAttachments : undefined,
       })
 
       debugLog(`[Discord] Engine response: text="${response.text.slice(0, 80)}...", actions=${JSON.stringify(response.actions ?? [])}`)
@@ -485,17 +595,39 @@ export class DiscordBridge {
     const delay = Math.min(500 + response.text.length * 15, 3000)
     await new Promise(r => setTimeout(r, delay))
 
+    // Check for screenshot markers in response text and extract them as actions
+    let responseText = response.text
+    const screenshotMatch = responseText.match(/SEND_SCREENSHOT:([^\n]+)/)
+    if (screenshotMatch) {
+      const filePath = screenshotMatch[1].trim()
+      const captionMatch = responseText.match(/CAPTION:([^\n]*)/)
+      const caption = captionMatch?.[1]?.trim() || undefined
+      // Remove the markers from text
+      responseText = responseText
+        .replace(/SEND_SCREENSHOT:[^\n]+\n?/g, '')
+        .replace(/CAPTION:[^\n]*\n?/g, '')
+        .replace(/Currently on:[^\n]*\n?/g, '')
+        .trim()
+      // Inject send_screenshot action
+      const actions = response.actions ? [...response.actions] : []
+      actions.push({ type: 'send_screenshot', filePath, caption } as any)
+      response = { ...response, text: responseText, actions }
+    }
+
     // Send text
     if (response.text) {
       // Clean up excessive blank lines (LLM leaves gaps where tags should be)
       const cleanText = response.text.replace(/\n\s*\n\s*\n/g, '\n\n').trim()
-      if (!cleanText) return
-      // Split long messages naturally at sentence boundaries
-      const chunks = splitMessage(cleanText)
-      for (const chunk of chunks) {
-        await channel.send(chunk)
-        if (chunks.length > 1) {
-          await new Promise(r => setTimeout(r, 800))
+      if (!cleanText) {
+        // Still process actions even if text is empty
+      } else {
+        // Split long messages naturally at sentence boundaries
+        const chunks = splitMessage(cleanText)
+        for (const chunk of chunks) {
+          await channel.send(chunk)
+          if (chunks.length > 1) {
+            await new Promise(r => setTimeout(r, 800))
+          }
         }
       }
     }
@@ -576,8 +708,32 @@ export class DiscordBridge {
           }
         }
 
+        if (action.type === 'send_screenshot') {
+          const ssAction = action as { type: 'send_screenshot'; filePath: string; caption?: string }
+          try {
+            const { readFileSync } = await import('fs')
+            const { resolve } = await import('path')
+
+            // Security: only allow screenshots from /tmp to prevent path traversal
+            const resolved = resolve(ssAction.filePath)
+            if (!resolved.startsWith('/tmp/')) {
+              debugLog(`[Discord] Screenshot path rejected — outside /tmp: ${resolved}`)
+              continue
+            }
+
+            const screenshotBuf = readFileSync(resolved)
+            debugLog(`[Discord] Sending screenshot: ${resolved} (${screenshotBuf.length} bytes)`)
+            const attachment = new AttachmentBuilder(screenshotBuf, { name: 'screenshot.png' })
+            const caption = ssAction.caption ? ssAction.caption : undefined
+            await channel.send({ content: caption, files: [attachment] })
+            debugLog(`[Discord] Screenshot sent successfully`)
+          } catch (err) {
+            debugLog(`[Discord] Screenshot send failed: ${err instanceof Error ? err.message : err}`)
+          }
+        }
+
         if (action.type === 'send_tweet') {
-          const tweetAction = action as any
+          const tweetAction = action as { type: 'send_tweet'; text: string }
           // Reuse already-generated image/video from earlier actions (no duplicate API calls)
           const mediaBuffer = lastGeneratedImageBuffer ?? lastGeneratedVideoBuffer ?? undefined
           const mediaType = lastGeneratedImageBuffer ? 'image' as const
@@ -602,11 +758,18 @@ export class DiscordBridge {
               mediaBuffer: mediaBuffer ?? undefined,
               mediaType,
             })
-            const success = results.some((r: any) => r.success)
-            if (success) {
+            const posted = results.find((r: any) => r.status === 'posted')
+            if (posted) {
               debugLog(`[Discord] Tweet posted successfully`)
-              const mediaLabel = mediaType === 'image' ? ' with selfie' : mediaType === 'video' ? ' with video' : ''
-              await channel.send(`✅ tweeted${mediaLabel}: "${tweetAction.text}"`)
+              // Check if media was requested but not attached (upload failed)
+              const hasMediaIds = posted.mediaUrls && posted.mediaUrls.length > 0
+              if (mediaBuffer && !hasMediaIds) {
+                const mediaLabel = mediaType === 'image' ? 'selfie' : 'video'
+                await channel.send(`✅ tweeted (text only — ${mediaLabel} upload failed): "${tweetAction.text}"`)
+              } else {
+                const mediaLabel = mediaType === 'image' ? ' with selfie' : mediaType === 'video' ? ' with video' : ''
+                await channel.send(`✅ tweeted${mediaLabel}: "${tweetAction.text}"`)
+              }
             } else {
               const errors = results.map((r: any) => r.error).filter(Boolean).join('; ')
               debugLog(`[Discord] Tweet failed: ${errors}`)

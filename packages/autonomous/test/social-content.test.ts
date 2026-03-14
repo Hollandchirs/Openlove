@@ -68,23 +68,23 @@ describe('SocialContentGenerator', () => {
       expect(counts.video_post).toBeGreaterThan(0)
     })
 
-    it('text_reflection is most common (50% weight)', () => {
+    it('selfie_post is most common (55% weight)', () => {
       const counts: Record<string, number> = { text_reflection: 0, selfie_post: 0, video_post: 0 }
       for (let i = 0; i < 2000; i++) {
         counts[generator.pickContentType()]++
       }
-      // text_reflection should be most common
-      expect(counts.text_reflection).toBeGreaterThan(counts.selfie_post)
-      expect(counts.text_reflection).toBeGreaterThan(counts.video_post)
+      // selfie_post should be most common (55% weight)
+      expect(counts.selfie_post).toBeGreaterThan(counts.text_reflection)
+      expect(counts.selfie_post).toBeGreaterThan(counts.video_post)
     })
 
-    it('video_post is least common (15% weight)', () => {
+    it('text_reflection is least common (20% weight)', () => {
       const counts: Record<string, number> = { text_reflection: 0, selfie_post: 0, video_post: 0 }
       for (let i = 0; i < 2000; i++) {
         counts[generator.pickContentType()]++
       }
-      expect(counts.video_post).toBeLessThan(counts.text_reflection)
-      expect(counts.video_post).toBeLessThan(counts.selfie_post)
+      expect(counts.text_reflection).toBeLessThan(counts.selfie_post)
+      expect(counts.text_reflection).toBeLessThan(counts.video_post)
     })
   })
 

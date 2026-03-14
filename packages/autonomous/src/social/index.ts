@@ -188,6 +188,13 @@ export class SocialEngine {
       return null
     }
 
+    // Check if current token has media.write scope
+    const currentScope = saved.scope ?? ''
+    if (!currentScope.includes('media.write')) {
+      console.warn('[Social/Twitter] ⚠️ Token missing "media.write" scope — image/video uploads will fail!')
+      console.warn('[Social/Twitter] Re-run `node test-twitter-oauth2.mjs` to re-authorize with media upload permission')
+    }
+
     // Refresh the token
     const basicAuth = Buffer.from(`${tc.clientId}:${tc.clientSecret}`).toString('base64')
     const body = new URLSearchParams({
@@ -270,17 +277,28 @@ export class SocialEngine {
     }
 
     try {
-      // Upload media first if provided (OAuth 2.0 only)
+      // Upload media first if provided
       let mediaIds: string[] = []
-      if (options?.mediaBuffer && this.twitterMode === 'oauth2' && this.oauth2AccessToken) {
-        const uploadResult = options.mediaType === 'video'
-          ? await uploadVideoToTwitter(options.mediaBuffer, this.oauth2AccessToken)
-          : await uploadImageToTwitter(options.mediaBuffer, this.oauth2AccessToken)
+      if (options?.mediaBuffer) {
+        const sizeKB = (options.mediaBuffer.length / 1024).toFixed(1)
+        console.log(`[Social/Twitter] Uploading ${options.mediaType ?? 'image'} (${sizeKB} KB) via ${this.twitterMode}...`)
 
-        if (uploadResult.success) {
-          mediaIds = [uploadResult.mediaId]
+        if (this.twitterMode === 'oauth2' && this.oauth2AccessToken) {
+          const uploadResult = options.mediaType === 'video'
+            ? await uploadVideoToTwitter(options.mediaBuffer, this.oauth2AccessToken)
+            : await uploadImageToTwitter(options.mediaBuffer, this.oauth2AccessToken)
+
+          if (uploadResult.success) {
+            mediaIds = [uploadResult.mediaId]
+            console.log(`[Social/Twitter] Media uploaded: ${uploadResult.mediaId}`)
+          } else {
+            console.error(`[Social/Twitter] Media upload FAILED: ${uploadResult.error}`)
+            console.error('[Social/Twitter] Posting text-only as fallback. If this persists:')
+            console.error('[Social/Twitter]   1. Re-run `node test-twitter-oauth2.mjs` to re-authorize with media.write scope')
+            console.error('[Social/Twitter]   2. Check your Twitter API tier supports media upload')
+          }
         } else {
-          console.warn(`[Social/Twitter] Media upload failed: ${uploadResult.error} — posting text-only`)
+          console.warn(`[Social/Twitter] Media upload not supported in ${this.twitterMode} mode — posting text-only`)
         }
       }
 

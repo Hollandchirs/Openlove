@@ -31,11 +31,12 @@ export interface SocialGenerationContext {
   browserUrl?: string
 }
 
-// Weighted random: text 50%, selfie 35%, video 15%
+// Weighted random: selfie 55%, video 25%, text 20%
+// Heavy on media — tweets with images get 2-3x engagement
 const CONTENT_WEIGHTS: Array<{ type: SocialContentType; weight: number }> = [
-  { type: 'text_reflection', weight: 50 },
-  { type: 'selfie_post', weight: 35 },
-  { type: 'video_post', weight: 15 },
+  { type: 'text_reflection', weight: 20 },
+  { type: 'selfie_post', weight: 55 },
+  { type: 'video_post', weight: 25 },
 ]
 
 export class SocialContentGenerator {

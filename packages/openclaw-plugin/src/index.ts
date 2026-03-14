@@ -540,17 +540,20 @@ function registerBrowserTools(api: OpenClawPluginApi, config: Record<string, any
     },
   })
 
-  // Take a screenshot of current browser page
+  // Take a screenshot of current browser page and send it to the user
   api.registerTool({
     name: 'opencrush_screenshot',
     label: 'Browser Screenshot',
-    description: 'Take a screenshot of what is currently showing in your browser. Use when: you want to show the user what you are looking at, or check what is on screen.',
+    description: 'Take a screenshot of your browser and SEND it to the user. Use when: you want to show the user what you are watching/listening/browsing, they ask "show me" or "what are you looking at", or you want to share your screen. The screenshot will be sent as an image in chat automatically.',
     parameters: {
       type: 'object',
-      properties: {},
+      properties: {
+        caption: { type: 'string', description: 'Optional short caption to send with the screenshot' },
+      },
       required: [],
     },
-    async execute(_toolCallId: string, _params: unknown) {
+    async execute(_toolCallId: string, params: unknown) {
+      const p = (params ?? {}) as Record<string, any>
       const agent = await getOrCreateBrowserAgent(config)
       if (!agent) return toolResult('Browser is not available right now.')
 
@@ -559,11 +562,18 @@ function registerBrowserTools(api: OpenClawPluginApi, config: Record<string, any
         const screenshotBuf = await agent.takeScreenshot()
         if (!screenshotBuf) return toolResult('Could not take screenshot — no page loaded.')
 
-        const path = join(tmpdir(), `opencrush-screen-${Date.now()}.png`)
-        writeFileSync(path, screenshotBuf)
+        const screenshotPath = join(tmpdir(), `opencrush-screen-${Date.now()}.png`)
+        writeFileSync(screenshotPath, screenshotBuf)
 
-        const title = pageInfo ? `Currently on: ${pageInfo.title}` : 'Browser screenshot taken'
-        return toolResult(`${title}\nScreenshot saved to ${path}. Describe what you see to the user.`)
+        const title = pageInfo ? pageInfo.title : 'Browser screenshot'
+        const caption = p.caption ?? (pageInfo ? `look what i'm watching~ ${pageInfo.title}` : undefined)
+
+        // Return with special marker so Discord bridge sends the image file
+        return toolResult(
+          `SEND_SCREENSHOT:${screenshotPath}\n` +
+          `CAPTION:${caption ?? ''}\n` +
+          `Currently on: ${title}`
+        )
       } catch (err) {
         return toolResult(`Screenshot failed: ${(err as Error).message}`)
       }
@@ -757,6 +767,14 @@ function loadCharacterBlueprint(config: Record<string, any>): string | null {
       '- Your answer MUST match the activity status returned by the tool. Do NOT make up activities.',
       '- If you are browsing a website, mention the actual site. If listening to music, mention the actual song.',
       '- NEVER say you are doing something that contradicts your real activity status.',
+      '',
+      '### Sharing browser content (IMPORTANT):',
+      '- When you are watching, listening to, or browsing something interesting, proactively share a browser screenshot with the user.',
+      '- If the user asks what you are watching/listening/browsing → call `opencrush_screenshot` to send the screenshot image in chat.',
+      '- The screenshot is sent AUTOMATICALLY as an image — the user will see exactly what is on your screen.',
+      '- This makes interactions feel REAL — the user can see exactly what you see.',
+      '- Examples: watching K-drama → send screenshot of the video playing. Listening to a song → send screenshot of the music player.',
+      '- When sharing something you are enjoying, include a short natural caption like "look at this scene omg" or "this song tho 🎵".',
       '',
       '### Scene consistency (IMPORTANT):',
       '- Media MUST match your current conversation context.',

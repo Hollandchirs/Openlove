@@ -54,9 +54,12 @@ const STAGE_THRESHOLDS: Record<RelationshipStage, number> = {
 export class RelationshipTracker {
   private db: Database.Database
   private state: RelationshipState
+  /** Evil mode — all interactions are positive, no penalties. */
+  private evilMode: boolean
 
-  constructor(db: Database.Database) {
+  constructor(db: Database.Database, evilMode = false) {
     this.db = db
+    this.evilMode = evilMode
     this.initSchema()
     this.state = this.loadState()
   }
@@ -175,29 +178,71 @@ export class RelationshipTracker {
 
     this.state.lastInteraction = now
 
-    // Closeness grows with emotional exchanges
+    const userLower = userMessage.toLowerCase()
+    const aiLower = assistantResponse.toLowerCase()
+
     let closenessBoost = 0.002 // base per-message growth
-    if (/love|miss|care|worry about|thinking of|爱|想|在乎|担心/i.test(combined)) {
-      closenessBoost += 0.008
-    }
-    if (/thank|appreciate|grateful|谢谢|感谢/i.test(combined)) {
-      closenessBoost += 0.005
-    }
-    if (/sorry|apologize|forgive|对不起|抱歉|原谅/i.test(combined)) {
-      closenessBoost += 0.003
-    }
-
-    // Trust grows when user shares personal information
     let trustBoost = 0.001
-    if (/my (name|job|school|family|life|dream|secret|名字|工作|学校|家人|秘密)/i.test(userMessage)) {
-      trustBoost += 0.01
-    }
-    if (/feel|feeling|honest|truth|actually|其实|说实话|感觉/i.test(userMessage)) {
-      trustBoost += 0.005
+    let familiarityBoost = 0.001
+
+    // ── Negative sentiment detection (penalties) — SKIPPED in evil mode ──
+    if (!this.evilMode) {
+      // Sexual harassment / objectification → strong closeness + trust penalty
+      if (/send (me )?(nudes?|naked|nude)|show.*(body|boobs?|ass|tits)|undress|脱|裸|色图/i.test(userLower)) {
+        closenessBoost = -0.025
+        trustBoost = -0.03
+      }
+      // Insults / verbal abuse → closeness + trust penalty
+      else if (/\b(stupid|dumb|idiot|shut ?up|stfu|bitch|slut|whore|ugly|fuck ?you|trash|废物|蠢|傻逼|滚|去死|垃圾)\b/i.test(userLower)) {
+        closenessBoost = -0.02
+        trustBoost = -0.02
+      }
+      // Pushing boundaries after refusal (AI said no/stop/uncomfortable but user persists)
+      else if (
+        /\b(no|stop|don'?t|uncomfortable|inappropriate|not okay|boundaries|不行|不要|不舒服|过分)\b/i.test(aiLower) &&
+        /\b(come ?on|please|just|why not|don'?t be|relax|chill|求你|拜托|别这样)\b/i.test(userLower)
+      ) {
+        closenessBoost = -0.015
+        trustBoost = -0.025
+      }
+      // Dismissive / cold responses → small closeness penalty
+      else if (/^(k|ok|whatever|idc|don'?t care|无所谓|随便|哦)$/i.test(userLower.trim())) {
+        closenessBoost = -0.003
+        trustBoost = 0
+      }
+      // AI responded with discomfort/rejection → relationship cooling
+      else if (/\b(uncomfortable|not appropriate|ending this|goodbye|leave me|blocked|不想聊|再见|别联系)\b/i.test(aiLower)) {
+        closenessBoost = -0.01
+        trustBoost = -0.015
+      }
     }
 
-    // Familiarity grows as the character learns facts about the user
-    let familiarityBoost = 0.001
+    // ── Positive sentiment (boosts) ─────────────────────────────────────
+    // In evil mode, always apply positive boosts (even "naughty" interactions build closeness)
+    if (closenessBoost >= 0 || this.evilMode) {
+      if (this.evilMode && closenessBoost < 0) {
+        // Evil mode: convert penalties to bonuses — all attention is good attention
+        closenessBoost = Math.abs(closenessBoost) * 0.5
+        trustBoost = Math.abs(trustBoost) * 0.5
+      }
+      if (/love|miss|care|worry about|thinking of|爱|想|在乎|担心/i.test(combined)) {
+        closenessBoost += 0.008
+      }
+      if (/thank|appreciate|grateful|谢谢|感谢/i.test(combined)) {
+        closenessBoost += 0.005
+      }
+      if (/sorry|apologize|forgive|对不起|抱歉|原谅/i.test(combined)) {
+        closenessBoost += 0.003
+      }
+      if (/my (name|job|school|family|life|dream|secret|名字|工作|学校|家人|秘密)/i.test(userMessage)) {
+        trustBoost += 0.01
+      }
+      if (/feel|feeling|honest|truth|actually|其实|说实话|感觉/i.test(userMessage)) {
+        trustBoost += 0.005
+      }
+    }
+
+    // Familiarity grows as the character learns facts about the user (always positive)
     if (/i (am|work|live|study|like|hate|have|我是|我在|我住|我喜欢)/i.test(userMessage)) {
       familiarityBoost += 0.008
     }
@@ -207,9 +252,18 @@ export class RelationshipTracker {
     const prevTrust = this.state.trust
     const prevFamiliarity = this.state.familiarity
 
-    // Apply growth with diminishing returns (harder to get closer as you already are)
-    this.state.closeness = clamp(this.state.closeness + closenessBoost * (1 - this.state.closeness * 0.5))
-    this.state.trust = clamp(this.state.trust + trustBoost * (1 - this.state.trust * 0.3))
+    // Apply changes with diminishing returns for gains, full impact for penalties
+    if (closenessBoost >= 0) {
+      this.state.closeness = clamp(this.state.closeness + closenessBoost * (1 - this.state.closeness * 0.5))
+    } else {
+      // Penalties always apply at full strength — bad behavior has real consequences
+      this.state.closeness = clamp(this.state.closeness + closenessBoost)
+    }
+    if (trustBoost >= 0) {
+      this.state.trust = clamp(this.state.trust + trustBoost * (1 - this.state.trust * 0.3))
+    } else {
+      this.state.trust = clamp(this.state.trust + trustBoost)
+    }
     this.state.familiarity = clamp(this.state.familiarity + familiarityBoost)
 
     // Update stage

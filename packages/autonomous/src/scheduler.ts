@@ -66,6 +66,9 @@ export class AutonomousScheduler {
       const launched = await this.config.browserAgent.launch()
       if (launched) {
         console.log('[Autonomous] Browser agent ready — real browser automation enabled')
+        // Wire up browser page checker so activity manager checks browser before going idle
+        const browser = this.config.browserAgent
+        this.config.activityManager.setBrowserPageChecker(() => browser.getCurrentPageInfo())
       } else {
         console.log('[Autonomous] Browser agent unavailable — presence-only mode')
       }

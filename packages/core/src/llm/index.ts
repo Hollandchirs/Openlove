@@ -102,6 +102,7 @@ export class LLMRouter {
     options: { stream?: boolean; staticPromptBreakpoint?: number } = {}
   ): Promise<string> {
     const maxRetries = 3
+    const hasImages = messages.some(m => m.images && m.images.length > 0)
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -110,10 +111,31 @@ export class LLMRouter {
         }
         return await this.chatOpenAICompat(systemPrompt, messages)
       } catch (err) {
+        const errMsg = (err as Error).message ?? ''
+
+        // If the model doesn't support vision, fall back to text-only (once, no further retries)
+        if (hasImages && (errMsg.includes('image') || errMsg.includes('multimodal') || errMsg.includes('vision') || errMsg.includes('content type'))) {
+          console.warn(`[LLM] Model doesn't support vision — falling back to text-only`)
+          const textOnlyMessages = messages.map(m => ({
+            ...m,
+            content: m.images && m.images.length > 0
+              ? `${m.content}\n[User sent ${m.images.length} image(s) but your model does not support image recognition]`
+              : m.content,
+            images: undefined,
+          }))
+          try {
+            return this.config.provider === 'anthropic'
+              ? await this.chatAnthropic(systemPrompt, textOnlyMessages, options.staticPromptBreakpoint)
+              : await this.chatOpenAICompat(systemPrompt, textOnlyMessages)
+          } catch (fallbackErr) {
+            throw fallbackErr // don't retry — propagate immediately
+          }
+        }
+
         const isRetryable = isRetryableError(err)
         if (attempt < maxRetries && isRetryable) {
           const backoffMs = 1000 * Math.pow(2, attempt - 1) // 1s, 2s, 4s
-          console.warn(`[LLM] Attempt ${attempt} failed (${(err as Error).message}), retrying in ${backoffMs}ms...`)
+          console.warn(`[LLM] Attempt ${attempt} failed (${errMsg}), retrying in ${backoffMs}ms...`)
           await new Promise(r => setTimeout(r, backoffMs))
           continue
         }
@@ -211,7 +233,22 @@ export class LLMRouter {
       model: this.config.model ?? 'claude-sonnet-4-6',
       max_tokens: this.config.maxTokens ?? 1024,
       system,
-      messages: messages.map(m => ({ role: m.role, content: m.content })),
+      messages: messages.map(m => ({
+        role: m.role,
+        content: m.images && m.images.length > 0
+          ? [
+              ...m.images.map(img => ({
+                type: 'image' as const,
+                source: {
+                  type: 'base64' as const,
+                  media_type: img.mediaType,
+                  data: img.base64,
+                },
+              })),
+              { type: 'text' as const, text: m.content || 'What do you see in this image?' },
+            ]
+          : m.content,
+      })),
     })
     const block = resp.content[0]
     if (block.type !== 'text') throw new Error('Unexpected Anthropic response type')
@@ -230,9 +267,20 @@ export class LLMRouter {
       max_tokens: this.config.maxTokens ?? 1024,
       temperature: this.config.temperature ?? 0.85,
       messages: [
-        { role: 'system', content: systemPrompt },
-        ...messages.map(m => ({ role: m.role, content: m.content })),
-      ],
+        { role: 'system' as const, content: systemPrompt },
+        ...messages.map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.images && m.images.length > 0
+            ? [
+                ...m.images.map(img => ({
+                  type: 'image_url' as const,
+                  image_url: { url: `data:${img.mediaType};base64,${img.base64}` },
+                })),
+                { type: 'text' as const, text: m.content || 'What do you see in this image?' },
+              ]
+            : m.content,
+        })),
+      ] as any,
     })
     return resp.choices[0]?.message?.content ?? ''
   }
@@ -253,9 +301,19 @@ export class LLMRouter {
 
 // ── Message type ──────────────────────────────────────────────────────────
 
+export interface ImageContent {
+  type: 'image'
+  /** Base64-encoded image data */
+  base64: string
+  /** MIME type (e.g., 'image/jpeg', 'image/png') */
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  /** Optional images attached to this message (vision/multimodal) */
+  images?: ImageContent[]
 }
 
 // ── Offline pseudo-embed ──────────────────────────────────────────────────

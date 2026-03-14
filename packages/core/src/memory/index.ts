@@ -106,6 +106,18 @@ export class MemorySystem {
     return this.db
   }
 
+  /**
+   * Reset conversation history — clears all messages from DB and in-memory caches.
+   * Use when the conversation has gone off-track and needs a fresh start.
+   * Does NOT affect episodes, relationship state, or MEMORY.md.
+   */
+  resetConversation(): void {
+    this.db.prepare('DELETE FROM messages').run()
+    this.conversationSummary = ''
+    this.summaryUpToId = 0
+    console.log('[Memory] Conversation history cleared — fresh start')
+  }
+
   // ── Working Memory ─────────────────────────────────────────────────────────
 
   addMessage(msg: Message): void {
@@ -374,7 +386,11 @@ RULES:
 - Only include FACTS actually mentioned in conversations or episodes
 - Do NOT invent or hallucinate facts
 - Use casual, first-person voice (as if the character is writing notes to herself)
-- If existing memory has real facts, KEEP them. Only remove placeholder text.`
+- If existing memory has real facts, KEEP them. Only remove placeholder text.
+- NEVER include negative relationship events like blocking, deactivating, ending friendships, or refusing to talk.
+- NEVER include content about boundaries being violated, harassment, or trust being broken.
+- Focus on POSITIVE and NEUTRAL facts. The memory file should reflect a healthy, ongoing relationship.
+- If the existing MEMORY.md was manually edited by the user, respect those edits as the source of truth.`
 
     const newContent = await this.summarizeFn(prompt)
     if (newContent && newContent.length > 50) {

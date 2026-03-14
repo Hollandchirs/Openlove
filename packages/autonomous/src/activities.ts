@@ -95,6 +95,8 @@ export class ActivityManager {
   private activityTimer?: NodeJS.Timeout
   private activityLog: Array<{ activity: ActivityState; startedAt: number; endedAt?: number }> = []
   private dailyRoutine: RoutineSlot[] = DEFAULT_DAILY_ROUTINE
+  /** Optional: check browser before going idle. If browser is still active, stay in browsing state. */
+  private browserPageChecker?: () => Promise<{ title: string; url: string } | null>
 
   /**
    * Register a callback that fires whenever the activity changes.
@@ -102,6 +104,14 @@ export class ActivityManager {
    */
   setCallback(cb: (activity: ActivityState) => void): void {
     this.onActivityChange = cb
+  }
+
+  /**
+   * Set a browser page checker that's called before transitioning to idle.
+   * If the browser is still showing content, keeps the browsing activity instead.
+   */
+  setBrowserPageChecker(checker: () => Promise<{ title: string; url: string } | null>): void {
+    this.browserPageChecker = checker
   }
 
   /**
@@ -135,11 +145,33 @@ export class ActivityManager {
       clearTimeout(this.activityTimer)
     }
 
-    this.activityTimer = setTimeout(() => {
+    this.activityTimer = setTimeout(async () => {
+      this.activityTimer = undefined
+
+      // Before going idle, check if browser is still showing content
+      if (this.browserPageChecker) {
+        try {
+          const page = await this.browserPageChecker()
+          if (page && page.title) {
+            // Browser still active — keep a browsing status instead of idle
+            const browsingActivity: ActivityState = {
+              type: 'browsing',
+              title: page.title,
+              url: page.url,
+            }
+            this.currentActivity = browsingActivity
+            this.onActivityChange?.(this.currentActivity)
+            console.log(`[Activity] Timer expired but browser still showing: ${page.title}`)
+            return
+          }
+        } catch {
+          /* browser check failed, fall through to idle */
+        }
+      }
+
       const idleLabel = this.getContextualIdleLabel()
       this.currentActivity = { type: 'idle', label: idleLabel }
       this.onActivityChange?.(this.currentActivity)
-      this.activityTimer = undefined
     }, durationMs)
   }
 
@@ -158,6 +190,21 @@ export class ActivityManager {
 
   getCurrentActivity(): ActivityState {
     return this.currentActivity
+  }
+
+  /** Human-readable description of current activity for system prompt injection. */
+  describeCurrentActivity(): string {
+    const a = this.currentActivity
+    switch (a.type) {
+      case 'listening':
+        return `listening to "${a.track}" by ${a.artist}${a.album ? ` (${a.album})` : ''}`
+      case 'watching':
+        return `watching ${a.title}${a.details ? ` — ${a.details}` : ''}`
+      case 'browsing':
+        return a.title ? `browsing ${a.title}` : 'browsing the web'
+      case 'idle':
+        return a.label
+    }
   }
 
   /**

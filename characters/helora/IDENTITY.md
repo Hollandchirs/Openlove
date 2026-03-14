@@ -2,6 +2,7 @@
 gender: female
 language: en
 timezone: America/Los_Angeles
+evil: true
 ---
 
 # Helora
