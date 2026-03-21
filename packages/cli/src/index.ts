@@ -315,6 +315,39 @@ async function main(): Promise<void> {
       break
     }
 
+    case 'card': {
+      const charName = process.argv[3]
+      if (!charName) {
+        console.log(chalk.red('\n  Usage: opencrush card <character-name>\n'))
+        process.exit(1)
+      }
+      const { generateCard } = await import('./card.js')
+      await generateCard(charName)
+      break
+    }
+
+    case 'export': {
+      const charName = process.argv[3]
+      if (!charName) {
+        console.log(chalk.red('\n  Usage: opencrush export <character-name>\n'))
+        process.exit(1)
+      }
+      const { exportCharacter } = await import('./export-import.js')
+      await exportCharacter(charName)
+      break
+    }
+
+    case 'import': {
+      const source = process.argv[3]
+      if (!source) {
+        console.log(chalk.red('\n  Usage: opencrush import <file.opencrush.tar.gz | url>\n'))
+        process.exit(1)
+      }
+      const { importCharacter } = await import('./export-import.js')
+      await importCharacter(source)
+      break
+    }
+
     case '--help':
     case 'help':
     case '-h': {
@@ -328,6 +361,9 @@ async function main(): Promise<void> {
     ${chalk.cyan('pnpm create-character')}   Create a new companion
     ${chalk.cyan('pnpm status')}       Show current status
     ${chalk.cyan('opencrush memory')}  View AI's memory, relationship, and impressions
+    ${chalk.cyan('opencrush card <name>')}   Generate a character card image
+    ${chalk.cyan('opencrush export <name>')} Export character as .tar.gz
+    ${chalk.cyan('opencrush import <file|url>')} Import a character package
 
   ${chalk.bold('Files:')}
     ${chalk.gray('.env')}              Your API keys and settings

@@ -1,7 +1,7 @@
 {
-  "name": "@opencrush/cli",
-  "version": "0.1.0",
-  "description": "CLI: setup wizard, character creator, start command",
+  "name": "opencrush",
+  "version": "0.2.0",
+  "description": "Your AI companion lives on your computer. She watches dramas, listens to music, and thinks of you.",
   "bin": {
     "opencrush": "./dist/index.js"
   },
@@ -9,6 +9,11 @@
   "exports": {
     ".": "./dist/index.js"
   },
+  "files": [
+    "dist/",
+    "README.md",
+    "package.json"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
@@ -18,7 +23,35 @@
     "create": "node dist/index.js create",
     "clean": "rm -rf dist"
   },
+  "keywords": [
+    "ai",
+    "companion",
+    "girlfriend",
+    "chatbot",
+    "discord",
+    "telegram",
+    "whatsapp",
+    "open-source",
+    "self-hosted",
+    "autonomous"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Hollandchirs/Opencrush"
+  },
+  "homepage": "https://github.com/Hollandchirs/Opencrush",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "sharp": "^0.33.0"
+  },
+  "optionalDependencies": {
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
     "@opencrush/core": "workspace:*",
     "@opencrush/bridge-discord": "workspace:*",
     "@opencrush/bridge-telegram": "workspace:*",
@@ -32,9 +65,7 @@
     "ora": "^8.1.1",
     "boxen": "^8.0.1",
     "zod": "^3.24.0",
-    "better-sqlite3": "^11.5.0"
-  },
-  "devDependencies": {
+    "gray-matter": "^4.0.3",
     "@types/figlet": "^1.7.0",
     "@types/inquirer": "^9.0.7",
     "typescript": "^5.7.0",

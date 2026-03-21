@@ -13,6 +13,8 @@ import { Bot, Context, InputFile } from 'grammy'
 import { ConversationEngine, OutgoingMessage } from '@opencrush/core'
 import { MediaEngine } from '@opencrush/media'
 
+type ImageStyle = 'casual' | 'mirror' | 'close-up' | 'location'
+
 export interface TelegramBridgeConfig {
   token: string
   ownerId: number
@@ -32,10 +34,10 @@ export class TelegramBridge {
 
   private setupHandlers(): void {
     // Private messages
-    this.bot.on('message:text', this.handleTextMessage.bind(this))
+    this.bot.on('message:text', (ctx) => this.handleTextMessage(ctx))
 
     // Voice messages from user (speech-to-text)
-    this.bot.on('message:voice', this.handleVoiceMessage.bind(this))
+    this.bot.on('message:voice', (ctx) => this.handleVoiceMessage(ctx))
 
     // Photo messages (user sends an image for discussion)
     this.bot.on('message:photo', async (ctx) => {
@@ -124,10 +126,13 @@ export class TelegramBridge {
 
         if (action.type === 'send_image') {
           await ctx.replyWithChatAction('upload_photo')
+          const isScenePhoto = action.style === 'location' && !/selfie|self-portrait/i.test(action.prompt)
+          const isBodyPartCloseup = /\b(toe|toes|feet|foot|nail|nails|pedicure|hand|hands|finger|fingers|manicure|脚|脚趾|指甲|美甲|手|手指)\b/i.test(action.prompt)
+          const refPath = (isScenePhoto || isBodyPartCloseup) ? undefined : this.config.engine.characterBlueprint.referenceImagePath
           const imageBuffer = await this.config.media.generateImage(
             action.prompt,
-            this.config.engine.characterBlueprint.referenceImagePath,
-            action.style
+            refPath,
+            action.style as ImageStyle | undefined
           )
           if (imageBuffer) {
             await ctx.replyWithPhoto(new InputFile(imageBuffer, 'photo.jpg'))
@@ -167,10 +172,13 @@ export class TelegramBridge {
         await new Promise(r => setTimeout(r, 1000))
 
         if (action.type === 'send_image') {
+          const isScene = action.style === 'location' && !/selfie|self-portrait/i.test(action.prompt)
+          const isBodyPart = /\b(toe|toes|feet|foot|nail|nails|pedicure|hand|hands|finger|fingers|manicure|脚|脚趾|指甲|美甲|手|手指)\b/i.test(action.prompt)
+          const ref = (isScene || isBodyPart) ? undefined : this.config.engine.characterBlueprint.referenceImagePath
           const imageBuffer = await this.config.media.generateImage(
             action.prompt,
-            this.config.engine.characterBlueprint.referenceImagePath,
-            action.style
+            ref,
+            action.style as ImageStyle | undefined
           )
           if (imageBuffer) {
             await this.bot.api.sendPhoto(this.config.ownerId, new InputFile(imageBuffer, 'photo.jpg'))

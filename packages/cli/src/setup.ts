@@ -163,21 +163,19 @@ export async function runSetupWizard(): Promise<void> {
     }])
 
     if (characterChoice === '__new__') {
-      const apiKey = envValues.ANTHROPIC_API_KEY ?? envValues.OPENAI_API_KEY
-      const provider = envValues.ANTHROPIC_API_KEY ? 'anthropic' : 'openai'
-      const created = await createCharacterFlow(apiKey, provider)
+      const apiKey = envValues[providerInfo.envKey]
+      const created = await createCharacterFlow(apiKey, llmProvider)
       characterName = created.folderName
-      await runTestChat(characterName, apiKey, provider)
+      await runTestChat(characterName, apiKey, llmProvider)
     } else {
       characterName = characterChoice
     }
   } else {
     console.log(chalk.gray('  No companions yet — let\'s create one!\n'))
-    const apiKey = envValues.ANTHROPIC_API_KEY ?? envValues.OPENAI_API_KEY
-    const provider = envValues.ANTHROPIC_API_KEY ? 'anthropic' : 'openai'
-    const created = await createCharacterFlow(apiKey, provider)
+    const apiKey = envValues[providerInfo.envKey]
+    const created = await createCharacterFlow(apiKey, llmProvider)
     characterName = created.folderName
-    await runTestChat(characterName, apiKey, provider)
+    await runTestChat(characterName, apiKey, llmProvider)
   }
 
   envValues.CHARACTER_NAME = characterName
@@ -223,14 +221,24 @@ export async function runSetupWizard(): Promise<void> {
       },
       {
         type: 'input',
+        name: 'clientId',
+        message: 'Application (Client) ID:\n  (Discord Developer Portal → General Information → Application ID)\n  ID: ',
+        validate: (v: string) => /^\d{17,20}$/.test(v) ? true : 'Should be a number like 123456789012345678',
+      },
+      {
+        type: 'input',
         name: 'ownerId',
         message: 'Your Discord User ID:\n  (Right-click your name in Discord → Copy User ID. Enable Developer Mode in Settings first)\n  ID: ',
         validate: (v: string) => /^\d{17,20}$/.test(v) ? true : 'Should be a number like 123456789012345678',
       },
     ])
     envValues.DISCORD_BOT_TOKEN = discordAnswers.token
+    envValues.DISCORD_CLIENT_ID = discordAnswers.clientId
     envValues.DISCORD_OWNER_ID = discordAnswers.ownerId
-    // Client ID can be derived from token, but let's ask to be safe
+
+    const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${discordAnswers.clientId}&permissions=277025770560&scope=bot`
+    console.log(chalk.cyan(`\n  📋 Invite your bot to a server:`))
+    console.log(chalk.white(`  ${inviteUrl}\n`))
   }
 
   if (platforms.includes('telegram')) {

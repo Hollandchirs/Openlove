@@ -79,9 +79,29 @@ export function killExistingProcess(): boolean {
   } catch { /* ignore */ }
 
   if (killed) {
-    // Wait for processes to fully exit
-    const waitUntil = Date.now() + 2000
-    while (Date.now() < waitUntil) { /* spin */ }
+    // Wait for processes to fully exit, then SIGKILL any survivors
+    execSync('sleep 2', { timeout: 5000 })
+
+    // Check if any old processes are still alive and force-kill them
+    try {
+      const survivors = execSync(
+        `ps aux | grep "[c]li/dist/index.js" | grep -v "${myPid}" | awk '{print $2}'`,
+        { encoding: 'utf-8', timeout: 5000 }
+      ).trim()
+      if (survivors) {
+        for (const pidStr of survivors.split('\n').filter(Boolean)) {
+          const pid = parseInt(pidStr, 10)
+          if (!isNaN(pid) && pid !== myPid) {
+            try {
+              process.kill(pid, 'SIGKILL')
+              console.log(chalk.yellow(`  Force-killed stubborn process (PID ${pid})`))
+            } catch { /* already dead */ }
+          }
+        }
+        execSync('sleep 1', { timeout: 3000 })
+      }
+    } catch { /* no survivors */ }
+
     console.log(chalk.green(`  Previous process(es) stopped.`))
   }
 
@@ -257,7 +277,10 @@ export async function startOpencrush(): Promise<void> {
 
   if (bridges.length === 0) {
     console.log(chalk.red('\n  ❌ No messaging platforms configured!'))
-    console.log(chalk.gray('  Add at least one: DISCORD_BOT_TOKEN or TELEGRAM_BOT_TOKEN in .env'))
+    console.log(chalk.gray('  Add at least one: DISCORD_BOT_TOKEN, TELEGRAM_BOT_TOKEN, or WHATSAPP_ENABLED=true in .env\n'))
+    console.log(chalk.yellow('  Quick fix: run "pnpm setup" to reconfigure platforms.'))
+    console.log(chalk.gray('  Or edit .env directly and add your platform token.\n'))
+    cleanupPidFile()
     process.exit(1)
   }
 
@@ -296,10 +319,13 @@ export async function startOpencrush(): Promise<void> {
   console.log(chalk.green(`  ✓ Autonomous scheduler running`))
 
   // ── Ready ───────────────────────────────────────────────────────────────
+  const gender = engine.characterBlueprint.gender
+  const pronoun = gender === 'male' ? 'He' : gender === 'nonbinary' ? 'They' : 'She'
+  const objectPronoun = gender === 'male' ? 'him' : gender === 'nonbinary' ? 'them' : 'her'
   console.log(chalk.magenta(`
   ══════════════════════════════════════
   💝 ${engine.characterName} is alive!
-  She's waiting for you to message her.
+  ${pronoun}'${gender === 'nonbinary' ? 're' : 's'} waiting for you to message ${objectPronoun}.
   ══════════════════════════════════════
   `))
 

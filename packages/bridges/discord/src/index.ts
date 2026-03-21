@@ -164,23 +164,26 @@ export class DiscordBridge {
 
       case 'idle':
       default: {
-        // Generate contextual mood/thought from conversation + activity context
-        const idleLabel = activity.type === 'idle' ? (activity as any).label : undefined
-        this.generateContextualStatus(idleLabel).then(statusText => {
-          if (!this.client.user) return
-          this.client.user.setPresence({
-            activities: [{ name: statusText, type: ActivityType.Custom }],
-            status: 'online',
-          })
-          console.log(`[Discord] Presence → ${statusText}`)
-        }).catch(() => {
-          // Fallback if LLM fails
-          const fallback = idleLabel ?? 'vibing'
-          this.client.user?.setPresence({
-            activities: [{ name: fallback, type: ActivityType.Custom }],
-            status: 'online',
-          })
+        // Use the idle label directly — no LLM hallucination
+        const idleLabel = activity.type === 'idle' ? (activity as any).label : 'vibing'
+        if (!this.client.user) break
+        this.client.user.setPresence({
+          activities: [{ name: idleLabel, type: ActivityType.Custom }],
+          status: 'online',
         })
+        console.log(`[Discord] Presence → Idle: ${idleLabel}`)
+
+        // Background LLM status update after 30s — evolves naturally
+        setTimeout(() => {
+          this.generateContextualStatus(idleLabel).then(statusText => {
+            if (!this.client.user) return
+            this.client.user.setPresence({
+              activities: [{ name: statusText, type: ActivityType.Custom }],
+              status: 'online',
+            })
+            console.log(`[Discord] Presence updated → ${statusText}`)
+          }).catch(() => { /* LLM status failed — keep existing */ })
+        }, 30_000)
         break
       }
     }
@@ -653,8 +656,12 @@ export class DiscordBridge {
           // Scene photos (style='location' with non-selfie prompt) should NOT use reference image
           // Reference image forces PuLID face consistency → always produces face photos
           const isScenePhoto = action.style === 'location' && !/selfie|self-portrait/i.test(action.prompt)
-          const refPath = isScenePhoto ? undefined : this.config.engine.characterBlueprint.referenceImagePath
-          debugLog(`[Discord] Generating image: prompt="${action.prompt}", style="${action.style}", scene=${isScenePhoto}, refPath="${refPath ?? 'none'}"`)
+          // Body part close-ups (feet, toes, hands, nails) should NOT use face reference
+          // PuLID anchors on face → produces weird face-merged results for non-face photos
+          const isBodyPartCloseup = /\b(toe|toes|feet|foot|nail|nails|pedicure|hand|hands|finger|fingers|manicure|脚|脚趾|指甲|美甲|手|手指)\b/i.test(action.prompt)
+          const skipReference = isScenePhoto || isBodyPartCloseup
+          const refPath = skipReference ? undefined : this.config.engine.characterBlueprint.referenceImagePath
+          debugLog(`[Discord] Generating image: prompt="${action.prompt}", style="${action.style}", scene=${isScenePhoto}, bodyPart=${isBodyPartCloseup}, refPath="${refPath ?? 'none'}"`)
           const imageBuffer = await this.config.media.generateImage(
             action.prompt,
             refPath,
