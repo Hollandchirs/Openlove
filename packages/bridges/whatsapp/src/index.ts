@@ -331,6 +331,22 @@ export class WhatsAppBridge {
           await this.sendVideo(jid, videoBuffer)
         }
       }
+
+      if (action.type === 'send_screenshot') {
+        const ssAction = action as { type: 'send_screenshot'; filePath: string; caption?: string }
+        try {
+          const { readFileSync } = await import('fs')
+          const { resolve } = await import('path')
+          const resolved = resolve(ssAction.filePath)
+          // Security: only allow screenshots from /tmp
+          if (resolved.startsWith('/tmp/')) {
+            const screenshotBuf = readFileSync(resolved)
+            await this.sendImage(jid, screenshotBuf, ssAction.caption)
+          }
+        } catch (err) {
+          console.error('[WhatsApp] Screenshot send failed:', (err as Error).message)
+        }
+      }
     }
 
     await this.sendPresenceUpdate(jid, 'paused')

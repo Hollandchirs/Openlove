@@ -10,12 +10,10 @@ import { join, basename } from 'path'
 import { execSync } from 'child_process'
 import chalk from 'chalk'
 
-function getRootDir(): string {
-  return process.env.INIT_CWD ?? process.cwd()
-}
+import { ROOT_DIR } from './paths.js'
 
 export async function exportCharacter(characterName: string): Promise<string> {
-  const rootDir = getRootDir()
+  const rootDir = ROOT_DIR
   const charDir = join(rootDir, 'characters', characterName)
 
   if (!existsSync(charDir)) {
@@ -37,7 +35,7 @@ export async function exportCharacter(characterName: string): Promise<string> {
 }
 
 export async function importCharacter(source: string): Promise<string> {
-  const rootDir = getRootDir()
+  const rootDir = ROOT_DIR
   const charactersDir = join(rootDir, 'characters')
   mkdirSync(charactersDir, { recursive: true })
 

@@ -191,6 +191,26 @@ export class TelegramBridge {
             await this.bot.api.sendVoice(this.config.ownerId, new InputFile(audioBuffer, 'voice.ogg'))
           }
         }
+
+        if (action.type === 'send_screenshot') {
+          const ssAction = action as { type: 'send_screenshot'; filePath: string; caption?: string }
+          try {
+            const { readFileSync } = await import('fs')
+            const { resolve } = await import('path')
+            const resolved = resolve(ssAction.filePath)
+            // Security: only allow screenshots from /tmp
+            if (resolved.startsWith('/tmp/')) {
+              const screenshotBuf = readFileSync(resolved)
+              await this.bot.api.sendPhoto(
+                this.config.ownerId,
+                new InputFile(screenshotBuf, 'screenshot.png'),
+                { caption: ssAction.caption }
+              )
+            }
+          } catch (err) {
+            console.error('[Telegram] Screenshot send failed:', (err as Error).message)
+          }
+        }
       }
     }
   }

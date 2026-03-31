@@ -1,11 +1,11 @@
 /**
  * Interactive Setup Wizard
  *
- * Guides first-time users through:
- * 1. API key configuration
- * 2. Platform selection (Discord/Telegram/WhatsApp)
- * 3. Character creation (or loads existing)
- * 4. Writes .env file
+ * 4-step flow designed for first-time users:
+ *   1. Pick your companion (from characters/ or create new)
+ *   2. Where do you want to chat? (WhatsApp / Discord / Telegram)
+ *   3. Give them a brain (one API key)
+ *   4. Extras (selfies, Spotify, voice, browser, Twitter — all optional)
  *
  * Design goal: a 12-year-old should be able to follow this.
  */
@@ -14,490 +14,514 @@ import inquirer from 'inquirer'
 import chalk from 'chalk'
 import ora from 'ora'
 import boxen from 'boxen'
-import { writeFileSync, existsSync, readdirSync } from 'fs'
-import { join, resolve } from 'path'
+import { writeFileSync, existsSync, readdirSync, readFileSync } from 'fs'
+import { join } from 'path'
+import { exec } from 'child_process'
+import matter from 'gray-matter'
 import { createCharacterFlow } from './create.js'
 import { runTestChat } from './test-chat.js'
-import { PROVIDER_INFO, detectRegion, getProviderInfo } from './llm-direct.js'
+import { PROVIDER_INFO, getProviderInfo } from './llm-direct.js'
+import { ROOT_DIR, ensureHomeDirExists, getEnvPath, getCharactersDir } from './paths.js'
+import { saveCharacterConfig, getDefaultConfig } from '@opencrush/core'
+import type { CharacterConfig } from '@opencrush/core'
 
-// pnpm sets INIT_CWD to where the user ran the command from (project root)
-// fall back to process.cwd() if not set
-const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
+ensureHomeDirExists()
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+async function openBrowser(url: string): Promise<void> {
+  const { confirm } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'confirm',
+    message: 'Open in browser to get the key?',
+    default: true,
+  }])
+  if (confirm) {
+    const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open'
+    exec(`${opener} "${url}"`)
+    await new Promise(r => setTimeout(r, 800))
+  }
+}
+
+function pronouns(gender: string): { they: string; them: string; their: string; theyre: string } {
+  if (gender === 'male') return { they: 'He', them: 'him', their: 'his', theyre: "He's" }
+  if (gender === 'nonbinary') return { they: 'They', them: 'them', their: 'their', theyre: "They're" }
+  return { they: 'She', them: 'her', their: 'her', theyre: "She's" }
+}
+
+interface CharacterInfo {
+  gender: string
+  age: string
+  location: string
+  tagline: string
+  hobbies: string[]
+}
+
+function getCharacterInfo(name: string): CharacterInfo {
+  const dir = join(getCharactersDir(), name)
+  const info: CharacterInfo = { gender: 'female', age: '', location: '', tagline: '', hobbies: [] }
+
+  const identityPath = join(dir, 'IDENTITY.md')
+  if (existsSync(identityPath)) {
+    try {
+      const raw = readFileSync(identityPath, 'utf-8')
+      const { data, content } = matter(raw)
+      info.gender = (data.gender as string) ?? 'female'
+      const ageMatch = content.match(/\*\*Age:\*\*\s*(.+)/i)
+      info.age = ageMatch?.[1]?.trim().split(/[,(]/)[0]?.trim() ?? ''
+      const fromMatch = content.match(/\*\*From:\*\*\s*(.+)/i)
+      info.location = fromMatch?.[1]?.trim().split(',')[0]?.trim() ?? ''
+      const hobbiesMatch = content.match(/\*\*Hobbies:\*\*\s*(.+)/i)
+      if (hobbiesMatch) {
+        info.hobbies = hobbiesMatch[1].split(',').map(h => h.trim()).filter(Boolean).slice(0, 3)
+      }
+    } catch { /* ignore */ }
+  }
+
+  const soulPath = join(dir, 'SOUL.md')
+  if (existsSync(soulPath)) {
+    try {
+      const soul = readFileSync(soulPath, 'utf-8')
+      // First sentence of SOUL.md as tagline
+      const firstLine = soul.split('\n').find(l => l.trim() && !l.startsWith('#'))
+      if (firstLine) {
+        info.tagline = firstLine.trim().split('.')[0]?.trim() ?? ''
+        if (info.tagline.length > 60) info.tagline = info.tagline.slice(0, 57) + '...'
+      }
+    } catch { /* ignore */ }
+  }
+
+  return info
+}
+
+function mapSetupVoiceProvider(v: string): 'elevenlabs' | 'fish_audio' | '' {
+  if (v === 'elevenlabs') return 'elevenlabs'
+  if (v === 'fishaudio' || v === 'fish_audio') return 'fish_audio'
+  return ''
+}
+
+function getExistingCharacters(): string[] {
+  const dir = getCharactersDir()
+  if (!existsSync(dir)) return []
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter(d => d.isDirectory() && d.name !== 'example')
+      .filter(d => existsSync(join(dir, d.name, 'IDENTITY.md')))
+      .map(d => d.name)
+  } catch { return [] }
+}
+
+function maybeOpenCard(name: string): void {
+  const cardPath = join(getCharactersDir(), name, 'card.png')
+  if (!existsSync(cardPath)) return
+  const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open'
+  exec(`${opener} "${cardPath}"`)
+}
+
+function generateEnvFile(values: Record<string, string>): string {
+  // Platform/voice/twitter/autonomous settings now live in per-character config.json.
+  // .env only holds LLM provider keys, media keys, browser, and Spotify.
+  const sections: Record<string, string[]> = {
+    '# ── AI Provider ──': ['LLM_PROVIDER', 'LLM_MODEL', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'XAI_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'MOONSHOT_API_KEY', 'ZHIPU_API_KEY', 'MINIMAX_API_KEY', 'OLLAMA_BASE_URL', 'OLLAMA_MODEL', 'JINA_API_KEY'],
+    '# ── Character ──': ['CHARACTER_NAME'],
+    '# ── Media (Selfies, Video) ──': ['FAL_KEY', 'IMAGE_MODEL', 'IMAGE_REFERENCE_MODEL'],
+    '# ── Browser Automation ──': ['BROWSER_AUTOMATION_ENABLED', 'BROWSER_MODE', 'BROWSER_CDP_ENDPOINT', 'BROWSER_PROFILE_DIR'],
+    '# ── Spotify ──': ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET'],
+  }
+
+  const lines = [
+    '# Opencrush Configuration',
+    '# Generated by setup wizard — edit anytime',
+    '',
+  ]
+
+  const used = new Set<string>()
+  for (const [header, keys] of Object.entries(sections)) {
+    const sectionLines: string[] = []
+    for (const key of keys) {
+      if (values[key] !== undefined) {
+        sectionLines.push(`${key}=${values[key]}`)
+        used.add(key)
+      }
+    }
+    if (sectionLines.length > 0) {
+      lines.push(header)
+      lines.push(...sectionLines)
+      lines.push('')
+    }
+  }
+
+  // Keys that live in per-character config.json — exclude from .env
+  const configJsonKeys = new Set([
+    'DISCORD_BOT_TOKEN', 'DISCORD_CLIENT_ID', 'DISCORD_OWNER_ID',
+    'TELEGRAM_BOT_TOKEN', 'TELEGRAM_OWNER_ID', 'WHATSAPP_ENABLED',
+    'TTS_PROVIDER', 'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID',
+    'FISH_AUDIO_API_KEY', 'FISH_AUDIO_VOICE_ID',
+    'TWITTER_CLIENT_ID', 'TWITTER_CLIENT_SECRET',
+    'SOCIAL_AUTO_POST', 'SOCIAL_MIN_POST_INTERVAL',
+    'QUIET_HOURS_START', 'QUIET_HOURS_END',
+    'PROACTIVE_MESSAGE_MIN_INTERVAL', 'PROACTIVE_MESSAGE_MAX_INTERVAL',
+  ])
+
+  for (const [key, value] of Object.entries(values)) {
+    if (!used.has(key) && !configJsonKeys.has(key)) lines.push(`${key}=${value}`)
+  }
+
+  lines.push('')
+  return lines.join('\n')
+}
+
+// ── Main Wizard ────────────────────────────────────────────────────────────
 
 export async function runSetupWizard(): Promise<void> {
   console.clear()
   console.log(chalk.magenta(`
-  ╔═══════════════════════════════════════╗
-  ║        💝  O P E N C R U S H          ║
-  ║    Your AI companion, always there    ║
-  ╚═══════════════════════════════════════╝
+  ╔══════════════════════════════════════════╗
+  ║          💝  O P E N C R U S H           ║
+  ║  Your AI companion lives on your device  ║
+  ╚══════════════════════════════════════════╝
   `))
 
-  console.log(chalk.cyan('Welcome! Let\'s set up your companion in a few steps.\n'))
-  console.log(chalk.gray('This will create a .env file with your settings.\n'))
+  console.log(chalk.cyan("  Let's get you set up. Takes about 2 minutes.\n"))
 
-  // ── Step 1: LLM Provider ────────────────────────────────────────────────
-  const region = detectRegion()
-  const isCN = region === 'cn'
+  // ── Mode selection ──────────────────────────────────────────────────────
+  const { setupMode } = await inquirer.prompt([{
+    type: 'list',
+    name: 'setupMode',
+    message: 'Pick a setup mode:',
+    choices: [
+      {
+        name: `⚡ Quick setup  ${chalk.gray('— pick or create a companion, core features (recommended)')}`,
+        value: 'quick',
+        short: 'Quick',
+      },
+      {
+        name: `🔧 Full setup   ${chalk.gray('— pick or create a companion + voice, browser, Twitter')}`,
+        value: 'full',
+        short: 'Full',
+      },
+    ],
+  }])
 
-  console.log(chalk.bold('\n📡 Step 1: Choose your AI brain\n'))
-  if (isCN) {
-    console.log(chalk.cyan('  检测到中国大陆时区 — 优先显示国内可直连的模型\n'))
-  } else {
-    console.log(chalk.gray('  Your companion needs an AI to think. All providers below work.\n'))
-  }
+  const TOTAL = 4
+  const step = (n: number, label: string) => console.log(chalk.cyan(`\n  [${n}/${TOTAL}] ${label}`))
 
-  // Build choice list — CN providers first for CN region
-  const cnFirst  = PROVIDER_INFO.filter(p => !p.requiresVPN && !p.isLocal)
-  const intl     = PROVIDER_INFO.filter(p =>  p.requiresVPN)
-  const local    = PROVIDER_INFO.filter(p =>  p.isLocal)
+  // ── Step 1: AI Brain ────────────────────────────────────────────────────
+  step(1, 'Choose your AI brain')
+  console.log(chalk.gray('  Pick whichever you already have a key for.\n'))
 
-  const orderedProviders = isCN
-    ? [...cnFirst, ...intl, ...local]
-    : [PROVIDER_INFO.find(p => p.id === 'anthropic')!, PROVIDER_INFO.find(p => p.id === 'openai')!, ...cnFirst, ...local]
+  const envValues: Record<string, string> = {}
+
+  const providerChoices = [
+    PROVIDER_INFO.find(p => p.id === 'anthropic')!,
+    PROVIDER_INFO.find(p => p.id === 'openai')!,
+    PROVIDER_INFO.find(p => p.id === 'xai')!,
+    PROVIDER_INFO.find(p => p.id === 'deepseek')!,
+    PROVIDER_INFO.find(p => p.id === 'qwen')!,
+    PROVIDER_INFO.find(p => p.id === 'kimi')!,
+    PROVIDER_INFO.find(p => p.id === 'zhipu')!,
+    PROVIDER_INFO.find(p => p.id === 'minimax')!,
+    PROVIDER_INFO.find(p => p.id === 'minimax-global')!,
+    PROVIDER_INFO.find(p => p.id === 'zai')!,
+    PROVIDER_INFO.find(p => p.isLocal)!,
+  ].filter(Boolean)
 
   const { llmProvider } = await inquirer.prompt([{
     type: 'list',
     name: 'llmProvider',
-    message: isCN ? '选择 AI 模型提供商:' : 'Which AI provider?',
-    choices: orderedProviders.map(p => ({
-      name: `${p.emoji}  ${p.name}\n     ${chalk.gray(isCN ? p.taglineCN : p.tagline)}`,
+    message: 'Which AI provider?',
+    choices: providerChoices.map(p => ({
+      name: `${p.emoji}  ${p.name}\n     ${chalk.gray(p.tagline)}`,
       value: p.id,
       short: p.name,
     })),
   }])
 
-  const envValues: Record<string, string> = { LLM_PROVIDER: llmProvider }
+  envValues.LLM_PROVIDER = llmProvider
   const providerInfo = getProviderInfo(llmProvider)!
 
-  // ── Collect API key for non-Ollama providers ──
+  let collectedApiKey: string | undefined
+  let collectedProvider: string | undefined
+
   if (llmProvider !== 'ollama') {
-    const keyUrl = isCN ? providerInfo.keyUrlCN : providerInfo.keyUrl
-    console.log(chalk.yellow(`\n  👉 ${isCN ? '获取 API Key: ' : 'Get API key: '}${keyUrl}\n`))
+    console.log(chalk.yellow(`\n  Get your API key: ${providerInfo.keyUrl}`))
+    await openBrowser(providerInfo.keyUrl)
 
     if (llmProvider === 'anthropic') {
-      console.log(chalk.gray(isCN
-        ? '  1. 注册账号 → API Keys → Create Key\n  2. 复制以 "sk-ant-" 开头的密钥\n'
-        : '  1. Create account → API Keys → Create Key\n  2. Copy the key (starts with "sk-ant-")\n'
-      ))
+      console.log(chalk.gray('  Sign up → API Keys → Create Key → copy the key (starts with "sk-ant-")\n'))
     } else if (llmProvider === 'openai') {
-      console.log(chalk.gray(isCN
-        ? '  1. 注册 → API Keys → Create new secret key\n'
-        : '  1. Sign up → API Keys → Create new secret key\n'
-      ))
+      console.log(chalk.gray('  Sign up → API Keys → Create new secret key\n'))
+    } else if (llmProvider === 'xai') {
+      console.log(chalk.gray('  Sign up → get $25 free credit → copy API key\n'))
     } else if (llmProvider === 'deepseek') {
-      console.log(chalk.gray(isCN
-        ? '  1. 注册 → API Keys → 创建 API Key\n  2. 新用户有免费额度\n'
-        : '  1. Sign up → API Keys → Create key\n  2. New users get free credits\n'
-      ))
-    } else if (llmProvider === 'qwen') {
-      console.log(chalk.gray(isCN
-        ? '  1. 登录阿里云控制台 → DashScope → API-KEY管理 → 创建\n'
-        : '  1. Aliyun console → DashScope → API-KEY management → Create\n'
-      ))
-    } else if (llmProvider === 'kimi') {
-      console.log(chalk.gray(isCN
-        ? '  1. 注册月之暗面 → 控制台 → API Keys → 新建\n'
-        : '  1. Sign up at Moonshot → Console → API Keys → New\n'
-      ))
-    } else if (llmProvider === 'zhipu') {
-      console.log(chalk.gray(isCN
-        ? '  1. 注册智谱开放平台 → 个人中心 → API Keys → 添加\n  2. 新用户赠送免费 tokens\n'
-        : '  1. Sign up at open.bigmodel.cn → API Keys → Add\n  2. Free tokens on signup\n'
-      ))
-    } else if (llmProvider === 'minimax') {
-      console.log(chalk.gray(isCN
-        ? '  1. 注册 MiniMax 开放平台 → 账号设置 → 接口密钥\n'
-        : '  1. Sign up at platform.minimaxi.com → Account → API Keys\n'
-      ))
+      console.log(chalk.gray('  Sign up → API Keys → Create key (new users get free credits)\n'))
     }
 
     const { apiKey } = await inquirer.prompt([{
       type: 'password',
       name: 'apiKey',
-      message: isCN ? `粘贴你的 ${providerInfo.name} API Key:` : `Paste your ${providerInfo.name} API key:`,
+      message: `Paste your ${providerInfo.name} API key:`,
       mask: '*',
       validate: (v: string) => {
-        if (!v.trim()) return isCN ? '请输入 API Key' : 'API key required'
+        if (!v.trim()) return 'API key required'
         if (providerInfo.keyPrefix && !v.startsWith(providerInfo.keyPrefix)) {
-          return isCN
-            ? `Key 格式不对，应以 "${providerInfo.keyPrefix}" 开头`
-            : `Should start with "${providerInfo.keyPrefix}"`
+          return `Should start with "${providerInfo.keyPrefix}"`
         }
         return true
       },
     }])
 
     envValues[providerInfo.envKey] = apiKey
-  }
-
-  // ── Ollama ──
-  if (llmProvider === 'ollama') {
-    console.log(chalk.yellow(isCN
-      ? '\n  确保 Ollama 已运行: https://ollama.ai'
-      : '\n  Make sure Ollama is running: https://ollama.ai'
-    ))
-    console.log(chalk.gray(isCN
-      ? '  运行: ollama pull qwen2.5:7b\n'
-      : '  Run: ollama pull qwen2.5:7b\n'
-    ))
+    collectedApiKey = apiKey
+    collectedProvider = llmProvider
+  } else {
+    console.log(chalk.yellow('\n  Make sure Ollama is running: https://ollama.ai'))
+    console.log(chalk.gray('  Run: ollama pull qwen2.5:7b\n'))
     envValues.OLLAMA_BASE_URL = 'http://localhost:11434'
     envValues.OLLAMA_MODEL = 'qwen2.5:7b'
   }
 
-  // ── Step 2: Character ────────────────────────────────────────────────────
-  console.log(chalk.bold('\n\n💝 Step 2: Your companion\n'))
+  // ── Step 2: Pick Your Companion ─────────────────────────────────────────
+  step(2, 'Pick your companion')
 
   const characters = getExistingCharacters()
   let characterName: string
+  let characterCreatedNew = false
+  let gender = 'female'
 
   if (characters.length > 0) {
-    const { characterChoice } = await inquirer.prompt([{
+    console.log(chalk.gray('  These companions are ready to go:\n'))
+
+    const choices = characters.map(c => {
+      const info = getCharacterInfo(c)
+      const parts = [info.age, info.location].filter(Boolean)
+      const desc = info.tagline || info.hobbies.join(', ')
+      if (desc) parts.push(desc)
+      const preview = parts.length > 0 ? chalk.gray(' · ' + parts.join(' · ')) : ''
+      return {
+        name: `✨ ${c}${preview}`,
+        value: c,
+        short: c,
+      }
+    })
+    choices.push({ name: '➕ Create someone new', value: '__new__', short: 'New' })
+
+    const { pick } = await inquirer.prompt([{
       type: 'list',
-      name: 'characterChoice',
-      message: 'Use an existing companion or create a new one?',
-      choices: [
-        ...characters.map(c => ({ name: `✨ ${c} (existing)`, value: c })),
-        { name: '➕ Create a new companion', value: '__new__' },
-      ],
+      name: 'pick',
+      message: 'Who do you want to talk to?',
+      choices,
     }])
 
-    if (characterChoice === '__new__') {
-      const apiKey = envValues[providerInfo.envKey]
-      const created = await createCharacterFlow(apiKey, llmProvider)
+    if (pick === '__new__') {
+      const created = await createCharacterFlow(collectedApiKey, collectedProvider)
       characterName = created.folderName
-      await runTestChat(characterName, apiKey, llmProvider)
+      characterCreatedNew = true
+      gender = created.gender
     } else {
-      characterName = characterChoice
+      characterName = pick
+      gender = getCharacterInfo(pick).gender
+      maybeOpenCard(characterName)
     }
   } else {
-    console.log(chalk.gray('  No companions yet — let\'s create one!\n'))
-    const apiKey = envValues[providerInfo.envKey]
-    const created = await createCharacterFlow(apiKey, llmProvider)
+    console.log(chalk.gray("  No companions found yet — let's create one!\n"))
+    const created = await createCharacterFlow(collectedApiKey, collectedProvider)
     characterName = created.folderName
-    await runTestChat(characterName, apiKey, llmProvider)
+    characterCreatedNew = true
+    gender = created.gender
   }
 
   envValues.CHARACTER_NAME = characterName
+  const pro = pronouns(gender)
 
-  // ── Step 3: Messaging Platform ───────────────────────────────────────────
-  console.log(chalk.bold('\n\n📱 Step 3: Where do you want to chat?\n'))
+  // Quick test chat if character was just created
+  if (characterCreatedNew && collectedApiKey) {
+    await runTestChat(characterName, collectedApiKey, collectedProvider ?? 'anthropic')
+  }
+
+  // ── Step 3: Where Do You Want to Chat? ──────────────────────────────────
+  step(3, `Where do you want to chat with ${characterName}?`)
 
   const { platforms } = await inquirer.prompt([{
     type: 'checkbox',
     name: 'platforms',
-    message: 'Select messaging platforms (use space to toggle, enter to confirm):',
+    message: 'Pick at least one:',
     choices: [
-      {
-        name: '🎮 Discord (Recommended — supports voice calls)',
-        value: 'discord',
-        checked: true,
-      },
-      {
-        name: '📬 Telegram',
-        value: 'telegram',
-      },
-      {
-        name: '💬 WhatsApp (uses QR code — no extra account needed)',
-        value: 'whatsapp',
-      },
+      { name: "💬 WhatsApp — scan a QR code and you're done (recommended)", value: 'whatsapp', checked: true },
+      { name: '🎮 Discord — supports voice calls', value: 'discord' },
+      { name: '📬 Telegram', value: 'telegram' },
     ],
-    validate: (choices: string[]) => choices.length > 0 ? true : 'Pick at least one platform',
+    validate: (v: string[]) => v.length > 0 ? true : 'Pick at least one',
   }])
 
   if (platforms.includes('discord')) {
-    console.log(chalk.yellow('\n  👉 Discord Bot Setup (takes ~2 minutes):'))
-    console.log(chalk.gray('  1. Go to: https://discord.com/developers/applications'))
-    console.log(chalk.gray('  2. Click "New Application" → give it your companion\'s name'))
-    console.log(chalk.gray('  3. Click "Bot" in the left menu → "Reset Token" → Copy the token'))
-    console.log(chalk.gray('  4. Enable "Message Content Intent" on the same page\n'))
+    console.log(chalk.yellow('\n  Discord bot setup (~2 min):'))
+    console.log(chalk.gray('  1. Go to discord.com/developers/applications'))
+    console.log(chalk.gray(`  2. "New Application" → name it "${characterName}"`))
+    console.log(chalk.gray('  3. "Bot" → "Reset Token" → copy the token'))
+    console.log(chalk.gray('  4. Turn on "Message Content Intent"\n'))
 
-    const discordAnswers = await inquirer.prompt([
+    const answers = await inquirer.prompt([
+      { type: 'password', name: 'token', message: 'Paste your Discord Bot Token:', mask: '*' },
       {
-        type: 'password',
-        name: 'token',
-        message: 'Paste your Discord Bot Token:',
-        mask: '*',
-      },
-      {
-        type: 'input',
-        name: 'clientId',
-        message: 'Application (Client) ID:\n  (Discord Developer Portal → General Information → Application ID)\n  ID: ',
+        type: 'input', name: 'clientId',
+        message: 'Application ID (General Information → Application ID):',
         validate: (v: string) => /^\d{17,20}$/.test(v) ? true : 'Should be a number like 123456789012345678',
       },
       {
-        type: 'input',
-        name: 'ownerId',
-        message: 'Your Discord User ID:\n  (Right-click your name in Discord → Copy User ID. Enable Developer Mode in Settings first)\n  ID: ',
+        type: 'input', name: 'ownerId',
+        message: 'Your Discord User ID (right-click your name → Copy User ID):',
         validate: (v: string) => /^\d{17,20}$/.test(v) ? true : 'Should be a number like 123456789012345678',
       },
     ])
-    envValues.DISCORD_BOT_TOKEN = discordAnswers.token
-    envValues.DISCORD_CLIENT_ID = discordAnswers.clientId
-    envValues.DISCORD_OWNER_ID = discordAnswers.ownerId
+    envValues.DISCORD_BOT_TOKEN = answers.token
+    envValues.DISCORD_CLIENT_ID = answers.clientId
+    envValues.DISCORD_OWNER_ID = answers.ownerId
 
-    const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${discordAnswers.clientId}&permissions=277025770560&scope=bot`
-    console.log(chalk.cyan(`\n  📋 Invite your bot to a server:`))
+    const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${answers.clientId}&permissions=277025770560&scope=bot`
+    console.log(chalk.cyan(`\n  Invite ${characterName} to your server:`))
     console.log(chalk.white(`  ${inviteUrl}\n`))
   }
 
   if (platforms.includes('telegram')) {
-    console.log(chalk.yellow('\n  👉 Telegram Bot Setup:'))
-    console.log(chalk.gray('  1. Open Telegram → search for @BotFather'))
+    console.log(chalk.yellow('\n  Telegram bot setup:'))
+    console.log(chalk.gray('  1. Open Telegram → search @BotFather'))
     console.log(chalk.gray('  2. Send /newbot → follow the steps'))
-    console.log(chalk.gray('  3. Copy the token it gives you\n'))
-    console.log(chalk.gray('  4. Find your user ID: search @userinfobot → send it /start\n'))
+    console.log(chalk.gray('  3. Copy the token it gives you'))
+    console.log(chalk.gray('  4. Your user ID: search @userinfobot → send /start\n'))
 
-    const telegramAnswers = await inquirer.prompt([
+    const answers = await inquirer.prompt([
+      { type: 'password', name: 'token', message: 'Paste your Telegram Bot Token:', mask: '*' },
       {
-        type: 'password',
-        name: 'token',
-        message: 'Paste your Telegram Bot Token:',
-        mask: '*',
-      },
-      {
-        type: 'input',
-        name: 'ownerId',
-        message: 'Your Telegram User ID (a number like 123456789):',
+        type: 'input', name: 'ownerId',
+        message: 'Your Telegram User ID (a number):',
         validate: (v: string) => /^\d+$/.test(v) ? true : 'Should be a number',
       },
     ])
-    envValues.TELEGRAM_BOT_TOKEN = telegramAnswers.token
-    envValues.TELEGRAM_OWNER_ID = telegramAnswers.ownerId
+    envValues.TELEGRAM_BOT_TOKEN = answers.token
+    envValues.TELEGRAM_OWNER_ID = answers.ownerId
   }
 
   if (platforms.includes('whatsapp')) {
     envValues.WHATSAPP_ENABLED = 'true'
-    console.log(chalk.cyan('\n  ℹ️ WhatsApp: No token needed! A QR code will appear when you start.'))
-    console.log(chalk.gray('  You\'ll scan it with WhatsApp on your phone (Linked Devices).'))
+    console.log(chalk.cyan(`\n  WhatsApp needs no setup! A QR code will appear when ${characterName} starts.`))
+    console.log(chalk.gray('  Scan it with WhatsApp → Linked Devices on your phone.'))
   }
 
-  // ── Step 4: Sensory Features ────────────────────────────────────────────
-  console.log(chalk.bold('\n\n✨ Step 4: Sensory features\n'))
-  console.log(chalk.gray(isCN
-    ? '这些功能让你的伴侣更加真实——看得见、听得到、有自己的社交圈。\n'
-    : 'These features make your companion come alive — visible, audible, and social.\n'))
+  // ── Step 4: Extras (all optional) ───────────────────────────────────────
+  step(4, 'Extras')
+  console.log(chalk.gray('  All optional — skip everything by pressing Enter.\n'))
 
-  const { optionalFeatures } = await inquirer.prompt([{
+  const quickChoices = [
+    { name: `📸 Send selfies and videos  ${chalk.gray('(fal.ai — free credits on signup)')}`, value: 'images', checked: true },
+    { name: `🎵 Listen to Spotify and share songs  ${chalk.gray('(Spotify API — free)')}`, value: 'spotify' },
+  ]
+  const fullChoices = [
+    { name: `📸 Send selfies and videos  ${chalk.gray('(fal.ai — free credits on signup)')}`, value: 'images', checked: true },
+    { name: `🎵 Listen to Spotify and share songs  ${chalk.gray('(Spotify API — free)')}`, value: 'spotify' },
+    { name: `🎤 Send voice messages  ${chalk.gray('(ElevenLabs / Fish Audio / FAL)')}`, value: 'voice' },
+    { name: `🌐 Browse the web and share screenshots  ${chalk.gray('(Playwright)')}`, value: 'browser' },
+    { name: `🐦 Post on Twitter/X  ${chalk.gray('(Twitter API + OAuth)')}`, value: 'twitter' },
+  ]
+
+  const { extras } = await inquirer.prompt([{
     type: 'checkbox',
-    name: 'optionalFeatures',
-    message: isCN ? '选择要启用的感官功能:' : 'Which features do you want?',
-    choices: [
-      { name: isCN
-        ? '📸 自拍 & 视频 — 可以发自拍和短视频 (需要 fal.ai key)'
-        : '📸 Selfies & Video — send photos and short videos (needs fal.ai key)',
-        value: 'images', checked: true },
-      { name: isCN
-        ? '🎤 语音消息 — 可以发语音 (ElevenLabs / Fish Audio / FAL Kokoro)'
-        : '🎤 Voice messages — send voice notes (ElevenLabs / Fish Audio / FAL Kokoro)',
-        value: 'voice' },
-      { name: isCN
-        ? '🐦 Twitter/X — 自主发推文、分享生活 (需要 Twitter API)'
-        : '🐦 Twitter/X — post tweets autonomously, share life moments (needs Twitter API)',
-        value: 'twitter' },
-      { name: isCN
-        ? '🌐 浏览器 — 能浏览网页、看视频、听音乐、分享截图'
-        : '🌐 Browser — browse web, watch videos, listen to music, share screenshots',
-        value: 'browser' },
-      { name: isCN
-        ? '🎵 Spotify 联动 — 在 Spotify 听歌并分享 (需要 Spotify API)'
-        : '🎵 Spotify — listen to music on Spotify and share songs (needs Spotify key)',
-        value: 'spotify' },
-    ],
+    name: 'extras',
+    message: `What else should ${characterName} do?`,
+    choices: setupMode === 'quick' ? quickChoices : fullChoices,
   }])
 
-  if (optionalFeatures.includes('images')) {
-    console.log(chalk.yellow('\n  👉 fal.ai API key (free credits on signup):'))
+  // ── Collect keys for selected extras ────────────────────────────────────
+
+  if (extras.includes('images')) {
+    console.log(chalk.yellow('\n  fal.ai API key (free credits on signup):'))
     console.log(chalk.gray('  https://fal.ai → Sign up → Dashboard → API Keys\n'))
     const { falKey } = await inquirer.prompt([{
-      type: 'password',
-      name: 'falKey',
-      message: 'Paste your fal.ai API key (or press Enter to skip):',
+      type: 'password', name: 'falKey',
+      message: 'Paste your fal.ai key (or Enter to skip):',
       mask: '*',
     }])
     if (falKey) envValues.FAL_KEY = falKey
   }
 
-  if (optionalFeatures.includes('voice')) {
+  if (extras.includes('spotify')) {
+    console.log(chalk.yellow('\n  Spotify API (free):'))
+    console.log(chalk.gray('  https://developer.spotify.com/dashboard → Create App → Copy Client ID & Secret\n'))
+    const answers = await inquirer.prompt([
+      { type: 'password', name: 'clientId', message: 'Spotify Client ID:', mask: '*' },
+      { type: 'password', name: 'clientSecret', message: 'Spotify Client Secret:', mask: '*' },
+    ])
+    if (answers.clientId) {
+      envValues.SPOTIFY_CLIENT_ID = answers.clientId
+      envValues.SPOTIFY_CLIENT_SECRET = answers.clientSecret
+    }
+  }
+
+  if (extras.includes('voice')) {
     const { ttsProvider } = await inquirer.prompt([{
       type: 'list',
       name: 'ttsProvider',
-      message: isCN ? '选择语音合成（TTS）提供商:' : 'Which voice provider?',
+      message: 'Which voice provider?',
       choices: [
-        {
-          name: `🗣️  ElevenLabs\n     ${chalk.gray(isCN ? '最自然、情感丰富，$5/月或免费额度' : 'Most natural, emotional — $5/mo or free tier')}`,
-          value: 'elevenlabs',
-          short: 'ElevenLabs',
-        },
-        {
-          name: `🐟  Fish Audio\n     ${chalk.gray(isCN ? '中英文支持好，有免费额度' : 'Good Chinese/English, free tier available')}`,
-          value: 'fishaudio',
-          short: 'Fish Audio',
-        },
-        {
-          name: `⚡  FAL Kokoro\n     ${chalk.gray(isCN ? '最便宜 $0.02/千字符，用已有的 fal.ai key' : 'Cheapest $0.02/1K chars, reuses your fal.ai key')}`,
-          value: 'fal',
-          short: 'FAL Kokoro',
-        },
+        { name: `🗣️  ElevenLabs  ${chalk.gray('— most natural, $5/mo or free tier')}`, value: 'elevenlabs', short: 'ElevenLabs' },
+        { name: `🐟  Fish Audio  ${chalk.gray('— good multilingual, free tier')}`, value: 'fishaudio', short: 'Fish Audio' },
+        { name: `⚡  FAL Kokoro  ${chalk.gray('— cheapest, reuses your fal.ai key')}`, value: 'fal', short: 'FAL Kokoro' },
       ],
     }])
-
     envValues.TTS_PROVIDER = ttsProvider
 
     if (ttsProvider === 'elevenlabs') {
-      console.log(chalk.yellow('\n  👉 ElevenLabs API key (10,000 characters/month free):'))
-      console.log(chalk.gray('  https://elevenlabs.io → Sign up → Profile → API Key\n'))
+      console.log(chalk.gray('\n  https://elevenlabs.io → Sign up → Profile → API Key\n'))
       const answers = await inquirer.prompt([
-        {
-          type: 'password',
-          name: 'apiKey',
-          message: 'Paste your ElevenLabs API key (or press Enter to skip):',
-          mask: '*',
-        },
-        {
-          type: 'input',
-          name: 'voiceId',
-          message: isCN ? 'Voice ID（可选，默认 Rachel）:' : 'Voice ID (optional, default Rachel):',
-        },
+        { type: 'password', name: 'apiKey', message: 'ElevenLabs API key (Enter to skip):', mask: '*' },
+        { type: 'input', name: 'voiceId', message: 'Voice ID (optional, default Rachel):' },
       ])
       if (answers.apiKey) envValues.ELEVENLABS_API_KEY = answers.apiKey
       if (answers.voiceId) envValues.ELEVENLABS_VOICE_ID = answers.voiceId
     }
 
     if (ttsProvider === 'fishaudio') {
-      console.log(chalk.yellow('\n  👉 Fish Audio API key:'))
-      console.log(chalk.gray('  https://fish.audio → Sign up → Profile → API Keys\n'))
+      console.log(chalk.gray('\n  https://fish.audio → Sign up → Profile → API Keys\n'))
       const answers = await inquirer.prompt([
-        {
-          type: 'password',
-          name: 'apiKey',
-          message: 'Paste your Fish Audio API key (or press Enter to skip):',
-          mask: '*',
-        },
-        {
-          type: 'input',
-          name: 'voiceId',
-          message: isCN ? 'Voice ID（在 fish.audio 声音库找）:' : 'Voice ID (find in Fish Audio voice library):',
-        },
+        { type: 'password', name: 'apiKey', message: 'Fish Audio API key (Enter to skip):', mask: '*' },
+        { type: 'input', name: 'voiceId', message: 'Voice ID (find in Fish Audio voice library):' },
       ])
       if (answers.apiKey) envValues.FISH_AUDIO_API_KEY = answers.apiKey
       if (answers.voiceId) envValues.FISH_AUDIO_VOICE_ID = answers.voiceId
     }
 
     if (ttsProvider === 'fal') {
-      console.log(chalk.cyan(isCN
-        ? '\n  ℹ️ FAL Kokoro 使用你已有的 fal.ai key，无需额外配置'
-        : '\n  ℹ️ FAL Kokoro reuses your fal.ai key — no extra setup needed'
-      ))
+      console.log(chalk.cyan('\n  FAL Kokoro reuses your fal.ai key — no extra setup needed.'))
       if (!envValues.FAL_KEY) {
-        console.log(chalk.yellow('  👉 https://fal.ai → Dashboard → API Keys\n'))
+        console.log(chalk.gray('  https://fal.ai → Dashboard → API Keys\n'))
         const { falKey } = await inquirer.prompt([{
-          type: 'password',
-          name: 'falKey',
-          message: 'Paste your fal.ai API key:',
-          mask: '*',
+          type: 'password', name: 'falKey', message: 'Paste your fal.ai key:', mask: '*',
         }])
         if (falKey) envValues.FAL_KEY = falKey
       }
     }
   }
 
-  if (optionalFeatures.includes('twitter')) {
-    console.log(chalk.yellow(isCN
-      ? '\n  👉 Twitter/X API 设置 (OAuth 2.0 — 支持 Free tier):'
-      : '\n  👉 Twitter/X API Setup (OAuth 2.0 — works on Free tier):'))
-    console.log(chalk.gray(isCN
-      ? '  1. 前往: https://developer.x.com → Dashboard → Create App'
-      : '  1. Go to: https://developer.x.com → Dashboard → Create App'))
-    console.log(chalk.gray(isCN
-      ? '  2. User authentication settings → 开启 OAuth 2.0'
-      : '  2. User authentication settings → Enable OAuth 2.0'))
-    console.log(chalk.gray(isCN
-      ? '  3. App permissions: Read and Write'
-      : '  3. App permissions: Read and Write'))
-    console.log(chalk.gray(isCN
-      ? '  4. Callback URL: https://localhost'
-      : '  4. Callback URL: https://localhost'))
-    console.log(chalk.gray(isCN
-      ? '  5. Keys and tokens → 复制 OAuth 2.0 Client ID 和 Client Secret\n'
-      : '  5. Keys and tokens → Copy OAuth 2.0 Client ID and Client Secret\n'))
-
-    const twitterAnswers = await inquirer.prompt([
-      {
-        type: 'password',
-        name: 'clientId',
-        message: isCN ? 'OAuth 2.0 Client ID:' : 'OAuth 2.0 Client ID:',
-        mask: '*',
-      },
-      {
-        type: 'password',
-        name: 'clientSecret',
-        message: isCN ? 'OAuth 2.0 Client Secret:' : 'OAuth 2.0 Client Secret:',
-        mask: '*',
-      },
-    ])
-    if (twitterAnswers.clientId) {
-      envValues.TWITTER_CLIENT_ID = twitterAnswers.clientId
-      envValues.TWITTER_CLIENT_SECRET = twitterAnswers.clientSecret
-      envValues.SOCIAL_AUTO_POST = 'true'
-    }
-
-    console.log(chalk.cyan(isCN
-      ? '\n  ℹ️  设置完成后，运行 `node test-twitter-oauth2.mjs` 完成 OAuth 授权'
-      : '\n  ℹ️  After setup, run `node test-twitter-oauth2.mjs` to complete OAuth authorization'))
-    console.log(chalk.gray(isCN
-      ? '  这会打开浏览器，授权后 AI 就可以自动发推了'
-      : '  This opens a browser to authorize — after that, your AI can post tweets automatically'))
-  }
-
-  if (optionalFeatures.includes('browser')) {
-    console.log(chalk.bold(isCN ? '\n  🌐 浏览器设置\n' : '\n  🌐 Browser Setup\n'))
-    console.log(chalk.gray(isCN
-      ? '  你的伴侣可以浏览网页、看 YouTube、刷 Twitter，还能给你分享截图。'
-      : '  Your companion can browse the web, watch YouTube, scroll Twitter, and share screenshots.'))
-    console.log(chalk.gray(isCN
-      ? '  需要安装 Playwright: npx playwright install chromium\n'
-      : '  Requires Playwright: npx playwright install chromium\n'))
+  if (extras.includes('browser')) {
+    console.log(chalk.gray(`\n  ${characterName} can browse the web, watch YouTube, scroll Twitter, and share screenshots.`))
+    console.log(chalk.gray('  Requires Playwright: npx playwright install chromium\n'))
 
     const { browserMode } = await inquirer.prompt([{
       type: 'list',
       name: 'browserMode',
-      message: isCN ? '浏览器模式:' : 'Browser mode:',
+      message: 'Browser mode:',
       choices: [
-        {
-          name: isCN
-            ? `🔌 CDP — 连接到你正在用的 Chrome (推荐)\n     ${chalk.gray('用: chrome://flags → Remote Debugging')}`
-            : `🔌 CDP — Connect to your running Chrome (recommended)\n     ${chalk.gray('Enable: chrome://flags → Remote Debugging')}`,
-          value: 'cdp',
-          short: 'CDP',
-        },
-        {
-          name: isCN
-            ? `💾 Persistent — 独立浏览器，保留登录状态\n     ${chalk.gray('独立于你的浏览器运行')}`
-            : `💾 Persistent — Separate browser, keeps login state\n     ${chalk.gray('Runs independently from your browser')}`,
-          value: 'persistent',
-          short: 'Persistent',
-        },
-        {
-          name: isCN
-            ? `🧪 Fresh — 每次启动新浏览器（无历史记录）`
-            : `🧪 Fresh — New browser each time (no history)`,
-          value: 'fresh',
-          short: 'Fresh',
-        },
+        { name: `🔌 CDP — connect to your running Chrome (recommended)\n     ${chalk.gray('Enable: chrome://flags → Remote Debugging')}`, value: 'cdp', short: 'CDP' },
+        { name: `💾 Persistent — separate browser, keeps login state`, value: 'persistent', short: 'Persistent' },
+        { name: `🧪 Fresh — new browser each time (no history)`, value: 'fresh', short: 'Fresh' },
       ],
     }])
-
     envValues.BROWSER_AUTOMATION_ENABLED = 'true'
     envValues.BROWSER_MODE = browserMode
 
     if (browserMode === 'cdp') {
-      console.log(chalk.gray(isCN
-        ? '\n  默认端口 9222，可自定义:'
-        : '\n  Default port 9222, or customize:'))
       const { cdpEndpoint } = await inquirer.prompt([{
-        type: 'input',
-        name: 'cdpEndpoint',
+        type: 'input', name: 'cdpEndpoint',
         message: 'CDP endpoint:',
         default: 'http://localhost:9222',
         validate: (v: string) => {
@@ -514,177 +538,157 @@ export async function runSetupWizard(): Promise<void> {
     }
   }
 
-  if (optionalFeatures.includes('spotify')) {
-    console.log(chalk.yellow('\n  👉 Spotify API (free):'))
-    console.log(chalk.gray('  https://developer.spotify.com/dashboard → Create App → Copy Client ID & Secret\n'))
-    const spotifyAnswers = await inquirer.prompt([
-      { type: 'password', name: 'clientId', message: 'Spotify Client ID:', mask: '*' },
-      { type: 'password', name: 'clientSecret', message: 'Spotify Client Secret:', mask: '*' },
+  if (extras.includes('twitter')) {
+    console.log(chalk.yellow('\n  Twitter/X API setup (OAuth 2.0 — works on Free tier):'))
+    console.log(chalk.gray('  1. developer.x.com → Dashboard → Create App'))
+    console.log(chalk.gray('  2. User authentication → Enable OAuth 2.0'))
+    console.log(chalk.gray('  3. App permissions: Read and Write'))
+    console.log(chalk.gray('  4. Callback URL: https://localhost'))
+    console.log(chalk.gray('  5. Keys and tokens → Copy Client ID and Client Secret\n'))
+
+    const answers = await inquirer.prompt([
+      { type: 'password', name: 'clientId', message: 'OAuth 2.0 Client ID:', mask: '*' },
+      { type: 'password', name: 'clientSecret', message: 'OAuth 2.0 Client Secret:', mask: '*' },
     ])
-    if (spotifyAnswers.clientId) {
-      envValues.SPOTIFY_CLIENT_ID = spotifyAnswers.clientId
-      envValues.SPOTIFY_CLIENT_SECRET = spotifyAnswers.clientSecret
+    if (answers.clientId) {
+      envValues.TWITTER_CLIENT_ID = answers.clientId
+      envValues.TWITTER_CLIENT_SECRET = answers.clientSecret
+      envValues.SOCIAL_AUTO_POST = 'true'
     }
+
+    console.log(chalk.cyan('\n  After setup, run `node test-twitter-oauth2.mjs` to finish OAuth.'))
+    console.log(chalk.gray(`  This opens a browser — after that, ${characterName} can post tweets.`))
   }
 
-  // ── Step 5: Behavior & Schedule ──────────────────────────────────────────
-  console.log(chalk.bold(isCN ? '\n\n⏰ Step 5: 行为 & 日程\n' : '\n\n⏰ Step 5: Behavior & Schedule\n'))
-  console.log(chalk.gray(isCN
-    ? '你的伴侣有自己的日常节奏——工作、放松、睡觉。这些设置控制她的自主行为。\n'
-    : 'Your companion has a daily rhythm — work, relax, sleep. These settings control autonomous behavior.\n'))
+  // ── Schedule (sensible defaults, one question) ──────────────────────────
 
-  const scheduleAnswers = await inquirer.prompt([
-    {
-      type: 'input',
-      name: 'quietStart',
-      message: isCN ? '几点开始安静时间（不主动发消息）? (0-23):' : 'When does quiet time start (no proactive messages)? (0-23):',
-      default: '23',
-      validate: (v: string) => { const n = Number(v); return Number.isInteger(n) && n >= 0 && n <= 23 ? true : 'Enter a whole number 0–23' },
-    },
-    {
-      type: 'input',
-      name: 'quietEnd',
-      message: isCN ? '几点结束安静时间? (0-23):' : 'When does quiet time end? (0-23):',
-      default: '8',
-      validate: (v: string) => { const n = Number(v); return Number.isInteger(n) && n >= 0 && n <= 23 ? true : 'Enter a whole number 0–23' },
-    },
-    {
-      type: 'list',
-      name: 'proactiveFrequency',
-      message: isCN ? '主动给你发消息的频率:' : 'How often should she message you on her own?',
-      choices: [
-        { name: isCN ? '🔥 经常 (1-2 小时)' : '🔥 Often (every 1-2 hours)', value: 'frequent' },
-        { name: isCN ? '⚡ 适中 (2-4 小时) — 推荐' : '⚡ Moderate (every 2-4 hours) — recommended', value: 'moderate' },
-        { name: isCN ? '🌙 偶尔 (4-8 小时)' : '🌙 Occasionally (every 4-8 hours)', value: 'rare' },
-        { name: isCN ? '🔇 从不主动' : '🔇 Never — only reply when I talk first', value: 'never' },
-      ],
-      default: 'moderate',
-    },
-  ])
+  console.log()
+  const { frequency } = await inquirer.prompt([{
+    type: 'list',
+    name: 'frequency',
+    message: `How often should ${characterName} text you first?`,
+    choices: [
+      { name: '🔥 A lot — every 1-2 hours', value: 'frequent' },
+      { name: '⚡ Sometimes — every 2-4 hours (recommended)', value: 'moderate' },
+      { name: '🌙 Rarely — every 4-8 hours', value: 'rare' },
+      { name: `🔇 Never — only when I message ${pro.them}`, value: 'never' },
+    ],
+    default: 'moderate',
+  }])
 
-  envValues.QUIET_HOURS_START = scheduleAnswers.quietStart
-  envValues.QUIET_HOURS_END = scheduleAnswers.quietEnd
-
-  const frequencyMap: Record<string, [string, string]> = {
+  const freqMap: Record<string, [string, string]> = {
     frequent: ['60', '120'],
     moderate: ['120', '240'],
     rare: ['240', '480'],
     never: ['99999', '99999'],
   }
-  const [minInterval, maxInterval] = frequencyMap[scheduleAnswers.proactiveFrequency] ?? ['120', '240']
+  const [minInterval, maxInterval] = freqMap[frequency] ?? ['120', '240']
+  envValues.QUIET_HOURS_START = '23'
+  envValues.QUIET_HOURS_END = '8'
   envValues.PROACTIVE_MESSAGE_MIN_INTERVAL = minInterval
   envValues.PROACTIVE_MESSAGE_MAX_INTERVAL = maxInterval
 
-  // ── Write .env ────────────────────────────────────────────────────────────
-  const spinner = ora('Writing configuration...').start()
+  // ── Write .env (LLM + media keys only) ──────────────────────────────────
 
+  const spinner = ora('Saving configuration...').start()
   const envContent = generateEnvFile(envValues)
-  writeFileSync(join(ROOT_DIR, '.env'), envContent, 'utf-8')
+  const envFilePath = getEnvPath()
+  writeFileSync(envFilePath, envContent, 'utf-8')
 
-  spinner.succeed('Configuration saved to .env')
-
-  // ── Build feature summary ────────────────────────────────────────────────
-  const enabledFeatures: string[] = []
-  enabledFeatures.push(`🧠 AI: ${providerInfo.name}`)
-  enabledFeatures.push(`💝 Character: ${characterName}`)
-  if (platforms.includes('discord'))  enabledFeatures.push('🎮 Discord')
-  if (platforms.includes('telegram')) enabledFeatures.push('📬 Telegram')
-  if (platforms.includes('whatsapp')) enabledFeatures.push('💬 WhatsApp')
-  if (optionalFeatures.includes('images'))  enabledFeatures.push('📸 Selfies & Video')
-  if (optionalFeatures.includes('voice'))   enabledFeatures.push(`🎤 Voice (${envValues.TTS_PROVIDER ?? 'n/a'})`)
-  if (optionalFeatures.includes('twitter')) enabledFeatures.push('🐦 Twitter (auto-post)')
-  if (optionalFeatures.includes('browser')) enabledFeatures.push(`🌐 Browser (${envValues.BROWSER_MODE})`)
-  if (optionalFeatures.includes('spotify')) enabledFeatures.push('🎵 Spotify')
-  enabledFeatures.push('💕 Emotion engine (auto)')
-  enabledFeatures.push('🤝 Relationship tracking (auto)')
-  enabledFeatures.push('🧠 Memory system (auto)')
-  enabledFeatures.push(`⏰ Quiet hours: ${scheduleAnswers.quietStart}:00 – ${scheduleAnswers.quietEnd}:00`)
-
-  const postSetupSteps: string[] = []
-  if (optionalFeatures.includes('twitter')) {
-    postSetupSteps.push(isCN
-      ? '  → 运行 node test-twitter-oauth2.mjs 完成 Twitter 授权'
-      : '  → Run node test-twitter-oauth2.mjs to authorize Twitter')
+  // ── Write per-character config.json (platform/voice/twitter/autonomous) ─
+  const charConfig: CharacterConfig = {
+    ...getDefaultConfig(),
+    discord: {
+      enabled: platforms.includes('discord') && Boolean(envValues.DISCORD_BOT_TOKEN),
+      botToken: envValues.DISCORD_BOT_TOKEN ?? '',
+      clientId: envValues.DISCORD_CLIENT_ID ?? '',
+      ownerId: envValues.DISCORD_OWNER_ID ?? '',
+    },
+    telegram: {
+      enabled: platforms.includes('telegram') && Boolean(envValues.TELEGRAM_BOT_TOKEN),
+      botToken: envValues.TELEGRAM_BOT_TOKEN ?? '',
+      ownerId: envValues.TELEGRAM_OWNER_ID ?? '',
+    },
+    whatsapp: { enabled: platforms.includes('whatsapp') },
+    voice: {
+      provider: mapSetupVoiceProvider(envValues.TTS_PROVIDER ?? ''),
+      elevenlabsKey: envValues.ELEVENLABS_API_KEY ?? '',
+      elevenlabsVoiceId: envValues.ELEVENLABS_VOICE_ID ?? '',
+      fishAudioKey: envValues.FISH_AUDIO_API_KEY ?? '',
+      fishAudioVoiceId: envValues.FISH_AUDIO_VOICE_ID ?? '',
+      conversationEnabled: platforms.includes('discord'),
+    },
+    twitter: {
+      clientId: envValues.TWITTER_CLIENT_ID ?? '',
+      clientSecret: envValues.TWITTER_CLIENT_SECRET ?? '',
+      apiKey: '',
+      apiSecret: '',
+      accessToken: '',
+      accessSecret: '',
+      autoPost: envValues.SOCIAL_AUTO_POST === 'true',
+      postInterval: parseInt(envValues.SOCIAL_MIN_POST_INTERVAL ?? '120') || 120,
+    },
+    autonomous: {
+      quietHoursStart: parseInt(envValues.QUIET_HOURS_START ?? '23') || 23,
+      quietHoursEnd: parseInt(envValues.QUIET_HOURS_END ?? '8') || 8,
+      proactiveMinInterval: parseInt(envValues.PROACTIVE_MESSAGE_MIN_INTERVAL ?? '60') || 60,
+      proactiveMaxInterval: parseInt(envValues.PROACTIVE_MESSAGE_MAX_INTERVAL ?? '240') || 240,
+    },
   }
-  if (optionalFeatures.includes('browser')) {
-    postSetupSteps.push(isCN
-      ? '  → 运行 npx playwright install chromium 安装浏览器'
-      : '  → Run npx playwright install chromium to install browser')
-  }
+  saveCharacterConfig(characterName, getCharactersDir(), charConfig)
 
-  // ── Done ──────────────────────────────────────────────────────────────────
+  spinner.succeed(`Configuration saved to ${envFilePath} + characters/${characterName}/config.json`)
+
+  // ── Build feature summary ──────────────────────────────────────────────
+
+  const enabled: string[] = []
+  enabled.push(`🧠 AI: ${providerInfo.name}`)
+  enabled.push(`💝 Character: ${characterName}`)
+  if (platforms.includes('discord'))  enabled.push('🎮 Discord')
+  if (platforms.includes('telegram')) enabled.push('📬 Telegram')
+  if (platforms.includes('whatsapp')) enabled.push('💬 WhatsApp')
+  if (extras.includes('images'))  enabled.push('📸 Selfies & Video')
+  if (extras.includes('voice'))   enabled.push(`🎤 Voice (${envValues.TTS_PROVIDER ?? 'n/a'})`)
+  if (extras.includes('twitter')) enabled.push('🐦 Twitter')
+  if (extras.includes('browser')) enabled.push(`🌐 Browser (${envValues.BROWSER_MODE})`)
+  if (extras.includes('spotify')) enabled.push('🎵 Spotify')
+  enabled.push('💕 Emotion engine')
+  enabled.push('🤝 Relationship tracking')
+  enabled.push('🧠 Memory')
+
+  const nextSteps: string[] = []
+  if (extras.includes('twitter')) nextSteps.push('  → Run node test-twitter-oauth2.mjs to finish Twitter auth')
+  if (extras.includes('browser')) nextSteps.push('  → Run npx playwright install chromium')
+
   console.log('\n' + boxen(
-    chalk.green('✅ Setup complete!\n\n') +
-    chalk.white('Enabled features:\n') +
-    enabledFeatures.map(f => chalk.cyan(`  ${f}`)).join('\n') + '\n\n' +
-    (postSetupSteps.length > 0
-      ? chalk.yellow('Next steps:\n') + postSetupSteps.join('\n') + '\n\n'
+    chalk.green('Done!\n\n') +
+    chalk.white('Enabled:\n') +
+    enabled.map(f => chalk.cyan(`  ${f}`)).join('\n') + '\n\n' +
+    (nextSteps.length > 0
+      ? chalk.yellow('Before starting:\n') + nextSteps.join('\n') + '\n\n'
       : '') +
-    chalk.white('Start your companion:\n') +
-    chalk.cyan('  pnpm start\n\n') +
-    chalk.white('Edit personality anytime:\n') +
+    chalk.white(`Start ${characterName}:\n`) +
+    chalk.cyan('  npx opencrush@latest start\n\n') +
+    chalk.white(`Edit ${pro.their} personality:\n`) +
     chalk.cyan(`  characters/${characterName}/SOUL.md\n\n`) +
-    chalk.gray('Need help? https://github.com/Hollandchirs/Opencrush'),
+    (setupMode === 'quick' ? chalk.gray('Unlock voice/browser/Twitter: run setup again → Full setup\n\n') : '') +
+    chalk.gray('https://github.com/heloraai/Opencrush'),
     { padding: 1, margin: 1, borderStyle: 'round', borderColor: 'magenta' }
   ))
-}
 
-function getExistingCharacters(): string[] {
-  const charactersDir = join(ROOT_DIR, 'characters')
-  if (!existsSync(charactersDir)) return []
-  try {
-    return readdirSync(charactersDir, { withFileTypes: true })
-      .filter((d: any) => d.isDirectory() && d.name !== 'example')
-      .map((d: any) => d.name)
-  } catch (err) {
-    console.warn('[Setup] Failed to list characters:', (err as Error).message)
-    return []
+  // ── Start now? ──────────────────────────────────────────────────────────
+
+  const { startNow } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'startNow',
+    message: `Start ${characterName} now?`,
+    default: true,
+  }])
+
+  if (startNow) {
+    const dotenv = await import('dotenv')
+    dotenv.config({ path: envFilePath, override: true })
+    const { startOpencrush } = await import('./start.js')
+    await startOpencrush()
   }
-}
-
-function generateEnvFile(values: Record<string, string>): string {
-  const sections: Record<string, string[]> = {
-    '# ── AI Provider ──': ['LLM_PROVIDER', 'LLM_MODEL', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'MOONSHOT_API_KEY', 'ZHIPU_API_KEY', 'MINIMAX_API_KEY', 'OLLAMA_BASE_URL', 'OLLAMA_MODEL', 'JINA_API_KEY'],
-    '# ── Character ──': ['CHARACTER_NAME'],
-    '# ── Messaging Platforms ──': ['DISCORD_BOT_TOKEN', 'DISCORD_OWNER_ID', 'DISCORD_CLIENT_ID', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_OWNER_ID', 'WHATSAPP_ENABLED'],
-    '# ── Media (Selfies, Voice, Video) ──': ['FAL_KEY', 'IMAGE_MODEL', 'IMAGE_REFERENCE_MODEL', 'TTS_PROVIDER', 'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID', 'FISH_AUDIO_API_KEY', 'FISH_AUDIO_VOICE_ID'],
-    '# ── Twitter/X ──': ['TWITTER_CLIENT_ID', 'TWITTER_CLIENT_SECRET', 'SOCIAL_AUTO_POST', 'SOCIAL_MIN_POST_INTERVAL'],
-    '# ── Browser Automation ──': ['BROWSER_AUTOMATION_ENABLED', 'BROWSER_MODE', 'BROWSER_CDP_ENDPOINT', 'BROWSER_PROFILE_DIR'],
-    '# ── Spotify ──': ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET'],
-    '# ── Behavior & Schedule ──': ['QUIET_HOURS_START', 'QUIET_HOURS_END', 'PROACTIVE_MESSAGE_MIN_INTERVAL', 'PROACTIVE_MESSAGE_MAX_INTERVAL'],
-  }
-
-  const lines = [
-    '# Opencrush Configuration',
-    '# Generated by setup wizard — you can edit this file anytime',
-    '# Emotion engine, relationship tracking, and memory are auto-enabled.',
-    '',
-  ]
-
-  const used = new Set<string>()
-
-  for (const [header, keys] of Object.entries(sections)) {
-    const sectionLines: string[] = []
-    for (const key of keys) {
-      if (values[key] !== undefined) {
-        sectionLines.push(`${key}=${values[key]}`)
-        used.add(key)
-      }
-    }
-    if (sectionLines.length > 0) {
-      lines.push(header)
-      lines.push(...sectionLines)
-      lines.push('')
-    }
-  }
-
-  // Any remaining keys not covered by sections
-  for (const [key, value] of Object.entries(values)) {
-    if (!used.has(key)) {
-      lines.push(`${key}=${value}`)
-    }
-  }
-
-  lines.push('')
-  return lines.join('\n')
 }

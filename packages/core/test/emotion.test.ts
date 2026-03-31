@@ -62,6 +62,27 @@ describe('EmotionEngine', () => {
       const desc = engine.getMoodDescription()
       expect(desc).toMatch(/neutral|calm/)
     })
+
+    it('changes from neutral after an affectionate message', () => {
+      engine.updateFromConversation('I love you so much babe', 'I adore you too darling')
+      const desc = engine.getMoodDescription()
+      expect(desc).not.toMatch(/^feeling neutral/)
+      expect(desc).toMatch(/affectionate|love|warm/)
+    })
+
+    it('changes from neutral after a happy message', () => {
+      engine.updateFromConversation('haha lol awesome amazing!', 'yay so happy and excited!')
+      const desc = engine.getMoodDescription()
+      expect(desc).not.toMatch(/^feeling neutral/)
+      expect(desc).toMatch(/happy|content|overjoyed/)
+    })
+
+    it('changes from neutral after an angry message', () => {
+      engine.updateFromConversation('I am so angry and furious!', 'I hate this stupid situation!')
+      const desc = engine.getMoodDescription()
+      expect(desc).not.toMatch(/^feeling neutral/)
+      expect(desc).toMatch(/annoyed|frustrated|angry/)
+    })
   })
 
   describe('updateFromConversation', () => {

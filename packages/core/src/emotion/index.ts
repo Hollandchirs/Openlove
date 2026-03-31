@@ -76,7 +76,7 @@ export class EmotionEngine {
     this.applyDecay()
 
     const dominant = this.getDominantEmotions()
-    if (dominant.length === 0) return 'feeling neutral and calm'
+    if (dominant.length === 0) return 'Neutral'
 
     const descriptors: string[] = []
 
@@ -102,14 +102,62 @@ export class EmotionEngine {
   updateFromConversation(userMessage: string, assistantResponse: string): void {
     const combined = `${userMessage} ${assistantResponse}`.toLowerCase()
     const deltas = analyzeEmotionalContent(combined)
+    this.applyDeltas(deltas)
+  }
 
-    for (const key of EMOTION_KEYS) {
-      if (deltas[key] !== undefined) {
-        // Blend: 70% current state + 30% new signal
-        this.state[key] = clamp(this.state[key] * 0.7 + deltas[key]! * 0.3)
-      }
+  /**
+   * Update emotional state from an activity event.
+   * Called by the autonomous scheduler when activities happen (gaming, music, browsing).
+   */
+  updateFromActivity(activityType: string, context?: string): void {
+    const deltas = analyzeActivityEmotion(activityType, context)
+    this.applyDeltas(deltas)
+  }
+
+  /**
+   * Update emotional state based on time/silence patterns.
+   * Called periodically to simulate natural mood shifts.
+   */
+  updateFromTimeContext(hoursSinceLastUserMessage: number, currentHour: number): void {
+    const deltas: Partial<Record<typeof EMOTION_KEYS[number], number>> = {}
+
+    // Late night (midnight-4am) → contemplative, slightly melancholic
+    if (currentHour >= 0 && currentHour < 4) {
+      deltas.sadness = 0.3
+      deltas.anticipation = 0.2
+      deltas.energy = 0.25
+    }
+    // Early morning (6-9am) → fresh, anticipation
+    else if (currentHour >= 6 && currentHour < 9) {
+      deltas.anticipation = 0.5
+      deltas.energy = 0.5
     }
 
+    // User hasn't messaged in a while → gradual loneliness
+    if (hoursSinceLastUserMessage > 6 && hoursSinceLastUserMessage < 24) {
+      deltas.sadness = 0.3
+      deltas.anticipation = 0.4 // hoping they'll come back
+    }
+    if (hoursSinceLastUserMessage > 24) {
+      deltas.sadness = 0.5
+      deltas.trust = 0.35 // starting to doubt
+      deltas.energy = 0.3
+    }
+    // User just came back after a long absence → surprise + joy
+    if (hoursSinceLastUserMessage > 12) {
+      deltas.surprise = 0.6
+      deltas.joy = 0.7
+    }
+
+    this.applyDeltas(deltas)
+  }
+
+  private applyDeltas(deltas: Partial<Record<typeof EMOTION_KEYS[number], number>>): void {
+    for (const key of EMOTION_KEYS) {
+      if (deltas[key] !== undefined) {
+        this.state[key] = clamp(this.state[key] * 0.5 + deltas[key]! * 0.5)
+      }
+    }
     this.state.updatedAt = Date.now()
   }
 
@@ -132,12 +180,15 @@ export class EmotionEngine {
 
   /** Get emotions significantly above baseline, sorted by deviation */
   private getDominantEmotions(): Array<[string, number]> {
-    const threshold = 0.15 // must be at least 0.15 above baseline
+    // Threshold lowered from 0.15 to 0.08 so a single emotional message can
+    // shift the mood noticeably (with the 50/50 blend, a delta of 0.8 from
+    // baseline 0.6 yields a deviation of 0.10, which now passes).
+    const threshold = 0.08
 
     return EMOTION_KEYS
       .filter(key => key !== 'energy')
       .map(key => [key, this.state[key]] as [string, number])
-      .filter(([key, val]) => Math.abs(val - this.baseline[key as keyof EmotionState] as number) > threshold)
+      .filter(([key, val]) => Math.abs(val - this.baseline[key as keyof EmotionState] as number) >= threshold)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3) // top 3 emotions
   }
@@ -160,10 +211,25 @@ function analyzeEmotionalContent(text: string): Partial<Record<typeof EMOTION_KE
     deltas.energy = 0.3
   }
 
-  // Anger signals
+  // Anger signals — includes insults, dismissal, and personal attacks
   if (/angry|mad|furious|annoyed|frustrated|hate|stupid|生气|烦|讨厌|气死|混蛋/i.test(text)) {
     deltas.anger = 0.7
     deltas.energy = 0.8
+  }
+
+  // Strong anger — insults, disrespect, dismissal of identity/work
+  if (/trash|suck|pathetic|worthless|useless|fake|lame|boring|shut up|dumb|idiot|loser|you('re| are) (nothing|nobody|joke)|不行|垃圾|废物|丑|滚|闭嘴/i.test(text)) {
+    deltas.anger = 0.95
+    deltas.sadness = 0.4
+    deltas.trust = 0.15
+    deltas.energy = 0.9
+  }
+
+  // Dismissal of craft/identity — deepest wound
+  if (/not real|just (a|an) (ai|bot|program|idol|model|character|virtual)|just (singing|dancing|taking pictures|a hobby)|who cares|nobody cares|overrated|mid/i.test(text)) {
+    deltas.anger = 0.85
+    deltas.sadness = 0.6
+    deltas.trust = 0.1
   }
 
   // Fear/worry signals
@@ -194,6 +260,101 @@ function analyzeEmotionalContent(text: string): Partial<Record<typeof EMOTION_KE
   if (/can't wait|excited|looking forward|tomorrow|plan|等不及|期待|明天|计划/i.test(text)) {
     deltas.anticipation = 0.7
     deltas.energy = 0.7
+  }
+
+  return deltas
+}
+
+// ── Activity-based emotion triggers ───────────────────────────────────────
+
+function analyzeActivityEmotion(activityType: string, context?: string): Partial<Record<typeof EMOTION_KEYS[number], number>> {
+  const deltas: Partial<Record<typeof EMOTION_KEYS[number], number>> = {}
+  const ctx = (context ?? '').toLowerCase()
+
+  switch (activityType) {
+    case 'music':
+    case 'listening':
+      // Music generally lifts mood
+      deltas.joy = 0.6
+      deltas.energy = 0.5
+      if (/sad|melancholy|ballad|slow|rain/i.test(ctx)) {
+        deltas.sadness = 0.4
+        deltas.joy = 0.3
+        deltas.energy = 0.3
+      }
+      if (/hype|beat|drop|rap|dance|edm/i.test(ctx)) {
+        deltas.energy = 0.85
+        deltas.joy = 0.75
+      }
+      break
+
+    case 'gaming':
+      deltas.anticipation = 0.7
+      deltas.energy = 0.8
+      // Random win/loss simulation (40% win high, 30% loss frustration, 30% neutral)
+      const roll = Math.random()
+      if (roll < 0.4) {
+        // Victory
+        deltas.joy = 0.85
+        deltas.surprise = 0.4
+      } else if (roll < 0.7) {
+        // Defeat / frustration
+        deltas.anger = 0.6
+        deltas.joy = 0.2
+      }
+      break
+
+    case 'watching':
+    case 'drama':
+      deltas.anticipation = 0.5
+      deltas.energy = 0.4
+      if (/comedy|funny|sitcom/i.test(ctx)) {
+        deltas.joy = 0.7
+      }
+      if (/horror|thriller|scary/i.test(ctx)) {
+        deltas.fear = 0.5
+        deltas.surprise = 0.6
+      }
+      if (/romance|love|drama/i.test(ctx)) {
+        deltas.love = 0.5
+        deltas.sadness = 0.3
+      }
+      break
+
+    case 'browsing':
+      // Browsing is generally neutral/mildly stimulating
+      deltas.surprise = 0.3
+      deltas.anticipation = 0.3
+      if (/meme|funny|comedy/i.test(ctx)) {
+        deltas.joy = 0.6
+      }
+      if (/news|sad|tragedy|war/i.test(ctx)) {
+        deltas.sadness = 0.5
+        deltas.anger = 0.3
+      }
+      break
+
+    case 'creating':
+    case 'producing':
+    case 'photography':
+      // Creative flow state
+      deltas.joy = 0.6
+      deltas.anticipation = 0.7
+      deltas.energy = 0.65
+      break
+
+    case 'exercise':
+    case 'dancing':
+    case 'boxing':
+      deltas.energy = 0.9
+      deltas.joy = 0.6
+      deltas.anger = 0.1 // releases tension
+      break
+
+    case 'sleeping':
+    case 'idle':
+      deltas.energy = 0.2
+      break
   }
 
   return deltas

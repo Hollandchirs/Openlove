@@ -24,9 +24,14 @@ characters/*/whatsapp-session/
 
 # Test scripts with credentials
 test-twitter-oauth2.mjs
+packages/media/test-voice.ts
+packages/media/test-yui.ts
 
 # CLI runtime characters data
 packages/cli/characters/
+
+# Character config files (contain platform credentials)
+characters/*/config.json
 
 # Keep example characters
 !characters/example/

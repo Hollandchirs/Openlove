@@ -5,7 +5,7 @@
  * This is the heart of Opencrush.
  */
 
-import { Blueprint, buildStaticSystemPrompt, buildDynamicContext, buildSystemPrompt, loadBlueprint } from './blueprint/index.js'
+import { Blueprint, buildStaticSystemPrompt, buildDynamicContext, buildSystemPrompt, loadBlueprint, buildRelationshipBehaviorContext } from './blueprint/index.js'
 import { MemorySystem, Message } from './memory/index.js'
 import { LLMRouter, LLMConfig, ChatMessage, ImageContent } from './llm/index.js'
 import { EmotionEngine } from './emotion/index.js'
@@ -46,6 +46,8 @@ export interface IncomingMessage {
 
 export interface OutgoingMessage {
   text: string
+  /** Current mood description from the emotion engine (e.g. "feeling affectionate, happy") */
+  mood?: string
   actions?: Array<
     | { type: 'send_image'; prompt: string; style?: string }
     | { type: 'send_voice'; text: string }
@@ -66,6 +68,8 @@ export class ConversationEngine {
   private emotion: EmotionEngine
   /** Relationship tracking — models closeness, trust, and shared experiences */
   private relationship: RelationshipTracker
+  /** Per-engine mutex — serializes respond() calls to prevent race conditions */
+  private respondLock: Promise<void> = Promise.resolve()
 
   constructor(config: EngineConfig) {
     this.config = config
@@ -80,6 +84,10 @@ export class ConversationEngine {
       (text) => this.llm.generate(text, 'Summarize the conversation concisely. Keep key facts, names, emotions, and topics. 2-3 sentences max.')
     )
     this.relationship = new RelationshipTracker(this.memory.getDatabase(), this.blueprint.meta.evilMode)
+    // Sync relationship stage with USER.md declarations (e.g., "boyfriend/girlfriend")
+    if (this.blueprint.user) {
+      this.relationship.setStageFloor(this.blueprint.user)
+    }
   }
 
   get characterName(): string {
@@ -95,11 +103,28 @@ export class ConversationEngine {
     this.config.activityProvider = provider
   }
 
+  /** Get the current mood description from the emotion engine */
+  getMood(): string {
+    return this.emotion.getMoodDescription()
+  }
+
+  /** Get the emotion engine for external triggers (activity, time, etc.) */
+  getEmotion(): EmotionEngine {
+    return this.emotion
+  }
+
   /**
    * Process an incoming message and return a response.
    * This is called by every bridge (Discord, Telegram, WhatsApp).
+   *
+   * Uses a simple promise-chain mutex to serialize concurrent calls per engine,
+   * preventing race conditions in memory read/write and LLM context assembly.
    */
   async respond(incoming: IncomingMessage): Promise<OutgoingMessage> {
+    const release = this.respondLock
+    let resolve!: () => void
+    this.respondLock = new Promise<void>(r => { resolve = r })
+    await release
     try {
       return await this.respondInternal(incoming)
     } catch (err) {
@@ -109,40 +134,57 @@ export class ConversationEngine {
         text: '... (sorry, my mind went blank for a second, give me a moment)',
         actions: [],
       }
+    } finally {
+      resolve()
     }
   }
 
   private async respondInternal(incoming: IncomingMessage): Promise<OutgoingMessage> {
+    // 0. Apply time-based emotion shifts before responding
+    try {
+      const lastInteraction = this.relationship.getState().lastInteraction
+      const hoursSinceUser = lastInteraction > 0 ? (Date.now() - lastInteraction) / (1000 * 60 * 60) : 0
+      const charHour = parseInt(new Date().toLocaleString('en-US', {
+        timeZone: this.blueprint.meta.timezone, hour: 'numeric', hour12: false
+      }), 10)
+      this.emotion.updateFromTimeContext(hoursSinceUser, charHour)
+    } catch { /* best-effort */ }
+
     // 1. Retrieve relevant memory context
     const context = await this.memory.getContext(incoming.content)
     const currentMood = this.emotion.getMoodDescription()
+    debugLog(`[Emotion] Current mood for prompt: "${currentMood}"`)
 
     // 2. Build system prompt: cached static + dynamic context (time, mood, relationship, activity)
-    const dynamicContext = buildDynamicContext(this.blueprint, currentMood)
+    // Resolve the real current activity from the ActivityManager (if wired up).
+    // This is passed into buildDynamicContext so the activity, scene, and rules
+    // all reflect the SAME state — no conflicting "normally doing X" vs "actually doing Y".
+    const realActivity = this.config.activityProvider?.() ?? undefined
+    debugLog(`[Engine] activityProvider returned: "${realActivity ?? '(none)'}"`)
+    const dynamicContext = buildDynamicContext(this.blueprint, currentMood, realActivity)
     const relationshipContext = `\n- **Your relationship:** ${this.relationship.getRelationshipContext()}`
 
-    // Inject real current activity so the AI never contradicts what it's actually doing
-    let activityContext = ''
-    if (this.config.activityProvider) {
-      const realActivity = this.config.activityProvider()
-      if (realActivity) {
-        activityContext = [
-          '\n\n## Your REAL Current Activity (CRITICAL — DO NOT CONTRADICT)',
-          `You are currently: **${realActivity}**`,
-          '- When the user asks "what are you doing?", your answer MUST match this activity.',
-          '- NEVER say you are doing something different from what is listed above.',
-          '- You can describe this activity naturally in your own words, but the core activity must match.',
-          `- Example: if your activity is "scrolling Pinterest", do NOT say "listening to music" or "watching Netflix".`,
-        ].join('\n')
-      }
-    }
+    // Inject relationship-gated behavioral rules from AUTONOMY.md
+    // This enforces stage-appropriate personality (e.g., idol distance at stranger stage)
+    const currentStage = this.relationship.getState().stage
+    const relationshipBehavior = buildRelationshipBehaviorContext(
+      this.blueprint.autonomy,
+      currentStage,
+      this.blueprint.name,
+    )
 
-    const systemPrompt = this.cachedStaticPrompt + dynamicContext + relationshipContext + activityContext
+    const systemPrompt = this.cachedStaticPrompt + dynamicContext + relationshipContext + relationshipBehavior
 
     // 3. Assemble conversation history for LLM
+    // Replace raw media markers with human-readable descriptions so the LLM
+    // doesn't hallucinate/copy them as its own response.
     const historyMessages: ChatMessage[] = context.recentMessages.map(m => ({
       role: m.role,
-      content: m.content,
+      content: m.content
+        .replace(/\[image:\/api\/media\/[^\]]*(?:\|model:[^\]]*)?(?:\]|$)/gi, '(photo sent)')
+        .replace(/\[voice:\/api\/media\/[^\]]*(?:\]|$)/gi, '(voice message sent)')
+        .replace(/\[video:\/api\/media\/[^\]]*(?:\|model:[^\]]*)?(?:\]|$)/gi, '(video sent)')
+        .trim() || (m.role === 'assistant' ? '(media sent)' : m.content),
     }))
 
     // 4. Inject semantic memory context if available
@@ -182,15 +224,33 @@ export class ConversationEngine {
       }
     }
 
+    // 6b. Inject an activity context reminder right before the user's message.
+    // This ensures the LLM sees the current activity CLOSE to the user's question,
+    // not buried deep in the system prompt. LLMs weigh recent context more heavily
+    // than distant system prompt sections, so this prevents the AI from citing
+    // a different song/show from conversation memory instead of the actual current activity.
+    const activityContextMessages: ChatMessage[] = []
+    if (realActivity) {
+      debugLog(`[Engine] Injecting activity context reminder: "${realActivity}"`)
+      activityContextMessages.push({
+        role: 'user',
+        content: `[System context — do not repeat this message, just use the information: You are currently ${realActivity}. If asked what you are doing or listening to, your answer MUST match this exactly.]`,
+      })
+      activityContextMessages.push({
+        role: 'assistant',
+        content: `(understood, I will reference "${realActivity}" if asked)`,
+      })
+    }
+
     // Call LLM (pass static prompt length for Anthropic prompt caching)
     const rawResponse = await this.llm.chat(
       fullSystemPrompt,
-      [...historyMessages, userMsg],
+      [...historyMessages, ...activityContextMessages, userMsg],
       { staticPromptBreakpoint: this.cachedStaticPrompt.length }
     )
 
     // 7. Parse response for embedded action triggers
-    const parsed = parseResponseActions(rawResponse)
+    const parsed = parseResponseActions(rawResponse, this.blueprint.meta.language)
 
     debugLog(`[Engine] Raw LLM response (first 200): ${rawResponse.slice(0, 200)}`)
     debugLog(`[Engine] Parsed actions: ${JSON.stringify(parsed.actions ?? [])}`)
@@ -200,16 +260,41 @@ export class ConversationEngine {
 
     if (!parsed.actions) parsed.actions = []
 
+    // 7a-gate. If the user did NOT ask for media, REMOVE unsolicited media actions.
+    // The LLM often ignores prompt instructions and attaches selfies/voice/video
+    // to every response. This is the hard enforcement layer.
+    if (mediaIntent !== 'selfie' && mediaIntent !== 'video') {
+      const hadImage = parsed.actions.some(a => a.type === 'send_image')
+      parsed.actions = parsed.actions.filter(a => a.type !== 'send_image')
+      if (hadImage) {
+        debugLog(`[Engine] Stripped unsolicited selfie — user did not request a photo`)
+      }
+    }
+    if (mediaIntent !== 'voice') {
+      const hadVoice = parsed.actions.some(a => a.type === 'send_voice')
+      if (hadVoice) {
+        // Keep the voice text as regular text reply instead of discarding
+        const voiceAction = parsed.actions.find(a => a.type === 'send_voice')
+        if (voiceAction?.text && !parsed.text) {
+          parsed.text = voiceAction.text
+        }
+        parsed.actions = parsed.actions.filter(a => a.type !== 'send_voice')
+        debugLog(`[Engine] Converted unsolicited voice to text — user did not request voice`)
+      }
+    }
+
     // 7b. Fallback: if user clearly asked for media but LLM forgot the tag, inject one
     const hasSelfieAction = parsed.actions.some(a => a.type === 'send_image')
     const hasVoiceAction = parsed.actions.some(a => a.type === 'send_voice')
     const hasVideoAction = parsed.actions.some(a => a.type === 'send_video')
 
+    const charTimezone = this.blueprint.meta.timezone
+
     if (mediaIntent === 'selfie' && !hasSelfieAction) {
       const isScene = detectSceneRequest(incoming.content, rawResponse)
       const fallbackPrompt = isScene
         ? extractSceneContext(incoming.content, rawResponse, this.blueprint.name)
-        : extractSelfieContext(incoming.content, rawResponse, this.blueprint.name)
+        : extractSelfieContext(incoming.content, rawResponse, this.blueprint.name, this.blueprint.identity, charTimezone, realActivity)
       const fallbackStyle = isScene ? 'location' : inferSelfieStyle(incoming.content, rawResponse)
       parsed.actions.push({ type: 'send_image', prompt: fallbackPrompt, style: fallbackStyle })
       debugLog(`[Engine] Fallback ${isScene ? 'scene' : 'selfie'} injected: style=${fallbackStyle}, "${fallbackPrompt}"`)
@@ -223,7 +308,7 @@ export class ConversationEngine {
     }
 
     if (mediaIntent === 'video' && !hasVideoAction) {
-      const videoPrompt = extractVideoContext(incoming.content, rawResponse, this.blueprint.name)
+      const videoPrompt = extractVideoContext(incoming.content, rawResponse, this.blueprint.name, this.blueprint.identity, charTimezone, realActivity)
       parsed.actions.push({ type: 'send_video', prompt: videoPrompt })
       debugLog(`[Engine] Fallback video injected: "${videoPrompt}"`)
     }
@@ -247,7 +332,7 @@ export class ConversationEngine {
 
       // If no selfie was already planned, inject one for both Discord and tweet
       if (!hasSelfie) {
-        const selfieDesc = extractSelfieContext(incoming.content, rawResponse, this.blueprint.name)
+        const selfieDesc = extractSelfieContext(incoming.content, rawResponse, this.blueprint.name, this.blueprint.identity, charTimezone, realActivity)
         parsed.actions.push({ type: 'send_image', prompt: selfieDesc, style: 'casual' })
       }
 
@@ -265,7 +350,7 @@ export class ConversationEngine {
           const isSceneRequest = detectSceneRequest(incoming.content, rawResponse)
           const prompt = isSceneRequest
             ? extractSceneContext(incoming.content, rawResponse, this.blueprint.name)
-            : extractSelfieContext(incoming.content, rawResponse, this.blueprint.name)
+            : extractSelfieContext(incoming.content, rawResponse, this.blueprint.name, this.blueprint.identity, charTimezone, realActivity)
           const style = isSceneRequest ? 'location' : inferSelfieStyle(incoming.content, rawResponse)
           parsed.actions.push({ type: 'send_image', prompt, style })
           debugLog(`[Engine] Pretend-send fallback: ${isSceneRequest ? 'scene' : 'selfie'} injected: "${prompt}"`)
@@ -274,9 +359,58 @@ export class ConversationEngine {
           parsed.actions.push({ type: 'send_voice', text: voiceText })
           debugLog(`[Engine] Pretend-send fallback: voice injected`)
         } else if (pretendIntent.type === 'video') {
-          const videoPrompt = extractVideoContext(incoming.content, rawResponse, this.blueprint.name)
+          const videoPrompt = extractVideoContext(incoming.content, rawResponse, this.blueprint.name, this.blueprint.identity, charTimezone, realActivity)
           parsed.actions.push({ type: 'send_video', prompt: videoPrompt })
           debugLog(`[Engine] Pretend-send fallback: video injected`)
+        }
+      }
+    }
+
+    // 7d. Deduplicate actions — keep only the first action of each type.
+    // The parser, first fallback, and second fallback can each independently inject
+    // a send_image action under edge-case timing, producing duplicate images.
+    {
+      const seenTypes = new Set<string>()
+      const dedupedActions: typeof parsed.actions = []
+      for (const action of parsed.actions) {
+        if (seenTypes.has(action.type)) {
+          debugLog(`[Engine] Dropping duplicate action: ${action.type}`)
+          continue
+        }
+        seenTypes.add(action.type)
+        dedupedActions.push(action)
+      }
+      parsed.actions = dedupedActions
+    }
+
+    // 7e. Enforce coherence between image and voice actions.
+    // When the LLM generates BOTH a selfie and a voice message, the image
+    // prompt must describe the SAME scene as the voice text. Otherwise the
+    // user sees a voice saying "making coffee in my kitchen" while the photo
+    // shows a mountain hike (because the image prompt was independently generated
+    // or the time context overrode the scene).
+    //
+    // Strategy: extract scene keywords from the voice text and enrich the
+    // image prompt with them so they stay coherent.
+    {
+      const imageAction = parsed.actions.find(a => a.type === 'send_image') as
+        | { type: 'send_image'; prompt: string; style?: string }
+        | undefined
+      const voiceAction = parsed.actions.find(a => a.type === 'send_voice') as
+        | { type: 'send_voice'; text: string }
+        | undefined
+
+      if (imageAction && voiceAction) {
+        const coherentPrompt = alignImagePromptWithVoice(
+          imageAction.prompt,
+          voiceAction.text
+        )
+        if (coherentPrompt !== imageAction.prompt) {
+          debugLog(
+            `[Engine] Aligned image prompt with voice context: ` +
+            `"${imageAction.prompt}" → "${coherentPrompt}"`
+          )
+          imageAction.prompt = coherentPrompt
         }
       }
     }
@@ -287,11 +421,32 @@ export class ConversationEngine {
     }
 
     // 8. Store exchange in memory + update emotional state + track relationship
-    await this.memory.consolidate(incoming.content, parsed.text)
+    // On the dashboard, when a send_image, send_voice, or send_video action is
+    // present, the generate-image/generate-voice/generate-video API route will
+    // write the canonical [image:url], [voice:url], or [video:url] message to the
+    // DB. If we also save the assistant text here, the user sees two messages per
+    // media request (one text, one media). Skip the text save for dashboard+media
+    // so only the media marker survives in the DB.
+    // For non-dashboard bridges (Discord, Telegram, WhatsApp), always save — those
+    // bridges handle media delivery directly and don't write to memory.db.
+    const hasMediaAction = (parsed.actions ?? []).some(
+      a => a.type === 'send_image' || a.type === 'send_voice' || a.type === 'send_video'
+    )
+    const isDashboard = incoming.platform === 'dashboard'
+    await this.memory.consolidate(incoming.content, parsed.text, {
+      skipAssistantSave: isDashboard && hasMediaAction,
+    })
+    const moodBefore = this.emotion.getMoodDescription()
     this.emotion.updateFromConversation(incoming.content, parsed.text)
+    const moodAfter = this.emotion.getMoodDescription()
+    if (moodBefore !== moodAfter) {
+      debugLog(`[Emotion] Mood changed: "${moodBefore}" → "${moodAfter}"`)
+    } else {
+      debugLog(`[Emotion] Mood unchanged: "${moodAfter}"`)
+    }
     this.relationship.recordInteraction(incoming.content, parsed.text)
 
-    return parsed
+    return { ...parsed, mood: moodAfter }
   }
 
   /**
@@ -350,19 +505,32 @@ export class ConversationEngine {
 
   async generateProactiveMessage(trigger: ProactiveTrigger): Promise<OutgoingMessage> {
     const proactiveMood = this.emotion.getMoodDescription()
-    const systemPrompt = this.cachedStaticPrompt + buildDynamicContext(this.blueprint, proactiveMood)
+    const proactiveStage = this.relationship.getState().stage
+    const proactiveRelBehavior = buildRelationshipBehaviorContext(
+      this.blueprint.autonomy,
+      proactiveStage,
+      this.blueprint.name,
+    )
+    const proactiveActivity = this.config.activityProvider?.() ?? undefined
+    const systemPrompt = this.cachedStaticPrompt + buildDynamicContext(this.blueprint, proactiveMood, proactiveActivity) + proactiveRelBehavior
 
     let prompt: string
     switch (trigger.type) {
       case 'music':
         prompt = `You just finished listening to "${trigger.data?.track ?? 'a song'}" by ${trigger.data?.artist ?? 'an artist'}. ` +
           `You want to share something about it with the user. Keep it natural and brief, like a text message. ` +
-          `Maybe share a lyric, how it made you feel, or a memory it triggered.`
+          `Maybe share a lyric, how it made you feel, or a memory it triggered. ` +
+          `You can optionally include a [SELFIE: location | description of what you look like right now, ` +
+          `e.g. "wearing headphones on the couch, phone screen showing the song, cozy lighting"] ` +
+          `to show the user a snapshot of your vibe. Only do this sometimes — maybe 40% of the time.`
         break
       case 'drama':
         prompt = `You just watched episode ${trigger.data?.episode ?? 'the latest'} of "${trigger.data?.show ?? 'a show you\'re watching'}". ` +
           `You have strong feelings about it and want to text the user about it. ` +
-          `Be excited/frustrated/sad depending on what happened. Don't summarize the whole plot.`
+          `Be excited/frustrated/sad depending on what happened. Don't summarize the whole plot. ` +
+          `You can optionally include a [SELFIE: location | description of what you look like right now, ` +
+          `e.g. "curled up on bed with laptop open, blanket wrapped around, screen glowing in dark room"] ` +
+          `to share the cozy watching vibe. Only do this sometimes — maybe 40% of the time.`
         break
       case 'morning':
         prompt = `It's morning. Send a natural morning greeting. Be sleepy, playful, or excited depending on your mood. ` +
@@ -391,7 +559,10 @@ export class ConversationEngine {
             `Text the user something natural and specific. Style: ${style}. ` +
             `IMPORTANT: Do NOT start with generic greetings like "hey" or "what's up". ` +
             `Jump straight into the thought. 1-2 sentences max, like a real text. ` +
-            `Be specific and concrete, never vague or philosophical.`
+            `Be specific and concrete, never vague or philosophical. ` +
+            `You can optionally include a [SELFIE: location | POV-style description of what you're doing right now, ` +
+            `e.g. "first-person view of laptop screen showing Bilibili, snacks on desk, dim room lighting"] ` +
+            `to show the user what you're up to. Only do this sometimes — maybe 30% of the time.`
         } else {
           prompt = `${topicHint ? topicHint.trim() + ' ' : ''}Text the user something casual and specific. Style: ${style}. ` +
             `IMPORTANT: Do NOT start with "hey" or ask "how are you". ` +
@@ -405,7 +576,10 @@ export class ConversationEngine {
           `Send a casual check-in — like you would text a close friend. ` +
           `Don't say "I miss you" or be dramatic. Just be normal. ` +
           `Examples of natural check-ins: "hey, you alive?", "whatcha doing", ` +
-          `or mention something you're doing right now. Keep it to 1 sentence.`
+          `or mention something you're doing right now. Keep it to 1 sentence. ` +
+          `You can optionally include a [SELFIE: location | what you look like right now while waiting, ` +
+          `e.g. "lying on bed scrolling phone, bored expression, messy room"] ` +
+          `to make it feel more real — like you're actually texting them from your life. Only do this sometimes.`
         break
       case 'social_post':
         prompt = trigger.data?.contentHint
@@ -426,7 +600,27 @@ export class ConversationEngine {
       timestamp: Date.now(),
     })
 
-    return parseResponseActions(response)
+    const result = parseResponseActions(response, this.blueprint.meta.language)
+
+    // Attach real browser screenshot if the scheduler captured one during the activity.
+    // This gives the user an authentic view of what the character was doing on screen.
+    if (trigger.screenshotPath) {
+      const actions = result.actions ? [...result.actions] : []
+      const captionMap: Record<string, string> = {
+        music: 'look what I\'m listening to rn',
+        drama: 'this is what I\'m watching btw',
+        random_thought: 'this is what I\'m looking at rn',
+        missing_you: 'this is what I\'m doing while waiting for you',
+      }
+      actions.push({
+        type: 'send_screenshot',
+        filePath: trigger.screenshotPath,
+        caption: captionMap[trigger.type],
+      })
+      return { ...result, actions }
+    }
+
+    return result
   }
 
   getMemory(): MemorySystem {
@@ -437,6 +631,10 @@ export class ConversationEngine {
 export interface ProactiveTrigger {
   type: 'music' | 'drama' | 'morning' | 'random_thought' | 'missing_you' | 'social_post'
   data?: Record<string, string>
+  /** Path to a browser screenshot taken during the activity (saved to /tmp).
+   *  When present, a send_screenshot action is appended to the response
+   *  so the user sees what the character was actually doing on screen. */
+  screenshotPath?: string
 }
 
 /**
@@ -447,16 +645,47 @@ export interface ProactiveTrigger {
  *   [VOICE: text to speak aloud]
  *   [VIDEO: short clip of ocean waves]
  */
-function parseResponseActions(raw: string): OutgoingMessage {
+function parseResponseActions(raw: string, language: string = 'en'): OutgoingMessage {
   const actions: OutgoingMessage['actions'] = []
   let text = raw
 
-  // Extract [SELFIE: ...] tags
-  // Supports: [SELFIE: description] or [SELFIE: style | description]
-  // Valid styles: casual, mirror, close-up, location
-  text = text.replace(/\[SELFIE:\s*([^\]]+)\]/gi, (_, raw) => {
+  // ---------------------------------------------------------------------------
+  // Phase 1: Strip ALL roleplay narration — aggressive patterns for CJK + English
+  // ---------------------------------------------------------------------------
+
+  // Chinese roleplay narration: (轻声笑了笑，带着一丝宠溺的语气) etc.
+  // Match ANY parenthetical that contains CJK characters (these are always narration, never real text messages)
+  text = text.replace(/\([^)]*[\u4e00-\u9fff\u3400-\u4dbf][^)]*\)\s*/g, '')
+
+  // English roleplay narration: (picks up phone), (laughs softly), (smiles), etc.
+  text = text.replace(/\((?:picks up|grabs|takes out|looks at|pulls out|opens|closes|puts down|reaches for|holds up|leans|sits|stands|walks|steps|turns|glances|stares|gazes|smiles|laughs|giggles|sighs|whispers|murmurs|blushes|nods|shakes|waves|winks|grins|chuckles|snorts|rolls eyes|bites lip|tilts head|runs hand|tucks hair|adjusts|fidgets|stretches|yawns)[^)]*\)\s*/gi, '')
+
+  // Asterisk roleplay: *smiles softly*, *laughs*, *picks up phone*
+  text = text.replace(/\*[^*]{2,60}\*\s*/g, '')
+
+  // Chinese-wrapped media tags: [发送照片：...], [发送语音：...], etc.
+  text = text.replace(/\[发送(?:照片|语音|视频)[：:]\s*/gi, '')
+
+  // Strip brackets wrapping the entire response — LLM sometimes mimics [placeholder]
+  // patterns from conversation history and wraps its whole reply in [...]
+  if (text.startsWith('[') && text.endsWith(']') && !text.includes('SELFIE') && !text.includes('VOICE') && !text.includes('VIDEO')) {
+    text = text.slice(1, -1)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 2: Strip hallucinated old media URLs
+  // ---------------------------------------------------------------------------
+  text = text.replace(/\[image:\/api\/media\/[^\]\s]*\]?/gi, '')
+  text = text.replace(/\[voice:\/api\/media\/[^\]\s]*\]?/gi, '')
+
+  // ---------------------------------------------------------------------------
+  // Phase 3: Extract media action tags
+  // ---------------------------------------------------------------------------
+
+  // Helper: parse image tag content into style + prompt
+  const parseImageTag = (rawContent: string): { prompt: string; style: string } => {
     const validStyles = ['casual', 'mirror', 'close-up', 'location']
-    const parts = raw.split('|').map((s: string) => s.trim())
+    const parts = rawContent.split('|').map((s: string) => s.trim())
     let style: string | undefined
     let prompt: string
 
@@ -464,8 +693,7 @@ function parseResponseActions(raw: string): OutgoingMessage {
       style = parts[0].toLowerCase()
       prompt = parts.slice(1).join('|').trim()
     } else {
-      prompt = raw.trim()
-      // Auto-detect style from description keywords
+      prompt = rawContent.trim()
       const lower = prompt.toLowerCase()
       if (lower.includes('mirror')) style = 'mirror'
       else if (lower.includes('close') || lower.includes('face')) style = 'close-up'
@@ -473,21 +701,55 @@ function parseResponseActions(raw: string): OutgoingMessage {
       else style = 'casual'
     }
 
+    return { prompt, style: style ?? 'casual' }
+  }
+
+  // Extract SELFIE/IMAGE tags — match both [SELFIE: ...] and (SELFIE: ...)
+  // The LLM sometimes uses parentheses, curly braces, or mixed brackets
+  text = text.replace(/[\[(\{](?:SELFIE|IMAGE):\s*([^\])\}]+)[\])\}]/gi, (_, raw) => {
+    const { prompt, style } = parseImageTag(raw)
     actions.push({ type: 'send_image', prompt, style })
     return ''
   })
 
-  // Extract [VOICE: ...] tags
-  text = text.replace(/\[VOICE:\s*([^\]]+)\]/gi, (_, content) => {
+  // Extract [VOICE: ...] / (VOICE: ...) tags
+  text = text.replace(/[\[(\{]VOICE:\s*([^\])\}]+)[\])\}]/gi, (_, content) => {
     actions.push({ type: 'send_voice', text: content.trim() })
     return ''
   })
 
-  // Extract [VIDEO: ...] tags
-  text = text.replace(/\[VIDEO:\s*([^\]]+)\]/gi, (_, prompt) => {
+  // Extract [VIDEO: ...] / (VIDEO: ...) tags
+  text = text.replace(/[\[(\{]VIDEO:\s*([^\])\}]+)[\])\}]/gi, (_, prompt) => {
     actions.push({ type: 'send_video', prompt: prompt.trim() })
     return ''
   })
+
+  // ---------------------------------------------------------------------------
+  // Phase 4: Post-process — enforce language in SELFIE/VOICE/VIDEO descriptions
+  // ---------------------------------------------------------------------------
+  // If the character language is English but the LLM wrote CJK in the descriptions,
+  // flag it with a debug log and strip the CJK content (image gen won't understand it anyway).
+  if (language === 'en') {
+    const hasCJK = /[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/
+    for (const action of actions) {
+      if (action.type === 'send_image' && hasCJK.test(action.prompt)) {
+        // Replace CJK characters with empty string — leaves English words intact
+        const cleaned = action.prompt.replace(/[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af，。！？、：；""''（）【】]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+        debugLog(`[Parser] Stripped CJK from SELFIE prompt: "${action.prompt}" → "${cleaned}"`)
+        action.prompt = cleaned || 'casual selfie, natural lighting'
+      }
+      if (action.type === 'send_voice' && hasCJK.test(action.text)) {
+        const cleaned = action.text.replace(/[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af，。！？、：；""''（）【】]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+        debugLog(`[Parser] Stripped CJK from VOICE text: "${action.text}" → "${cleaned}"`)
+        action.text = cleaned || 'hey'
+      }
+    }
+    // Also strip any remaining CJK from the main response text (the LLM violated the language rule)
+    if (hasCJK.test(text)) {
+      debugLog(`[Parser] WARNING: Response contains CJK text despite language=en. Stripping CJK characters.`)
+      text = text.replace(/[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af，。！？、：；""''（）【】]+/g, '').replace(/\s{2,}/g, ' ').trim()
+    }
+  }
 
   return {
     text: text.trim(),
@@ -530,23 +792,33 @@ function detectMediaIntent(content: string): 'selfie' | 'voice' | 'video' | 'twe
   if (voicePatterns.some(p => p.test(lower))) return 'voice'
 
   // Selfie / photo patterns (broadest — check last)
-  // Be careful: "show me the view" or "see the sunset" are NOT selfie requests
+  // ONLY match EXPLICIT requests for photos/selfies/pictures.
+  // Do NOT match casual questions like "what are you doing", "how are you", etc.
+  // Only match EXPLICIT requests for photos. Reject messages that mention
+  // "selfie" in a non-request context (e.g., "why did you send me this selfie?")
+  const antiSelfiePatterns = [
+    /why.*(send|sent).*selfie/i,
+    /why.*selfie/i,
+    /stop.*send/i,
+    /don't.*send/i,
+    /didn't.*ask/i,
+    /this selfie/i,
+    /that selfie/i,
+  ]
+  if (antiSelfiePatterns.some(p => p.test(lower))) return null
+
   const selfiePatterns = [
-    /selfie/i, /self[- ]?ie/i,
-    /take a pic/i, /send.*photo/i, /send.*pic/i, /show.*face/i,
-    /see you\b/i, /see.*in the screen/i, /what.*look like/i,
-    /看看你/i, /自拍/i, /发.*照/i, /拍.*照/i,
-    /give me a (selfie|photo|pic)/i, /can (i|you).*selfie/i,
-    /send me a (selfie|photo|pic)/i, /take a (selfie|photo|pic)/i,
-    /let me see you/i, /看.*你/i, /想看你/i,
-    /show me (you|your|yourself)/i,
+    /send me a (selfie|photo|pic|picture)/i,
+    /take a (selfie|photo|pic|picture)/i,
+    /give me a (selfie|photo|pic|picture)/i,
+    /can you send.*(selfie|photo|pic|picture)/i,
     /photo of you/i, /picture of you/i, /pic of you/i,
-    // Scene / non-selfie image requests (treated as selfie intent, scene detection happens later)
-    /see.*view/i, /see.*window/i, /see.*room/i, /see.*setup/i,
-    /show.*view/i, /show.*window/i, /show.*room/i, /show.*setup/i,
-    /show.*matcha/i, /show.*food/i, /show.*drink/i,
-    /see.*matcha/i, /see.*food/i, /see.*drink/i,
-    /wanna see/i, /want to see/i, /i wanna see/i,
+    /show me (a )?(selfie|photo|pic|picture)/i,
+    /let me see you/i, /what.*look like/i,
+    /看看你/i, /自拍/i, /发.*照/i, /拍.*照/i,
+    /想看你/i,
+    /show me.*(view|window|room|setup|food|drink|matcha)/i,
+    /send.*(view|window|room|setup|food|drink|matcha).*photo/i,
     /看.*窗/i, /看.*外面/i, /看.*房间/i,
   ]
   if (selfiePatterns.some(p => p.test(lower))) return 'selfie'
@@ -644,21 +916,44 @@ function detectPretendMedia(
 
 /**
  * Extract video context from user message and LLM response.
+ *
+ * @param currentActivity — When provided by the ActivityManager, overrides
+ *   the text-based activity guessing so the video matches the displayed status.
  */
-function extractVideoContext(userMessage: string, llmResponse: string, characterName: string): string {
+function extractVideoContext(userMessage: string, llmResponse: string, characterName: string, identity?: string, timezone?: string, currentActivity?: string): string {
   const combined = `${userMessage} ${llmResponse}`.toLowerCase()
   const locationContext = extractLocationContext(combined)
-  const activityContext = extractActivityContext(combined)
-  const outfitContext = extractOutfitContext(combined)
-  const timeContext = extractTimeContext(combined)
+
+  // When a real activity is available from the ActivityManager, use it instead of
+  // guessing from conversation text. This ensures the video matches the status display.
+  const activityContext = currentActivity
+    ? activityToSelfieContext(currentActivity)
+    : extractActivityContext(combined)
+
+  // Pass identity so outfit picks from the character's actual wardrobe
+  const outfitContext = extractOutfitContext(combined, identity)
+  // Use character's timezone for accurate lighting
+  const timeContext = extractTimeContext(combined, timezone)
+
+  // Key visual traits first for prominence
+  const keyTraits = identity ? extractKeyVisualTraits(identity) : ''
+  const appearanceDesc = identity ? extractAppearanceFromIdentity(identity) : ''
 
   const parts = [
     `short video clip of ${characterName}`,
-    outfitContext,
-    activityContext || 'natural expression',
-    locationContext,
-    timeContext,
-  ].filter(Boolean)
+  ]
+
+  if (keyTraits) {
+    parts.push(keyTraits)
+  }
+
+  if (appearanceDesc) {
+    parts.push(`(character appearance: ${appearanceDesc})`)
+  }
+
+  parts.push(
+    ...[outfitContext, activityContext || 'natural expression', locationContext, timeContext].filter(Boolean)
+  )
 
   // Append user's original description as supplementary context
   if (userMessage.length > 10) {
@@ -693,25 +988,149 @@ function extractTweetText(llmResponse: string): string {
 }
 
 /**
+ * Extract the "## Appearance" section from a character's IDENTITY.md content.
+ * Returns a trimmed string of the appearance description, or empty string if not found.
+ */
+function extractAppearanceFromIdentity(identity: string): string {
+  const appearanceMatch = identity.match(/##\s*Appearance\s*\n([\s\S]*?)(?=\n##\s|\n---|$)/i)
+  if (!appearanceMatch) return ''
+
+  // Filter out stage/performance costume sentences — they confuse image
+  // models when generating casual selfies with long irrelevant descriptions
+  const fullText = appearanceMatch[1].replace(/\s+/g, ' ').trim()
+  const sentences = fullText.split(/(?<=\.)\s+/)
+  const filtered = sentences.filter((s) => {
+    const lower = s.toLowerCase()
+    if (
+      lower.includes('on stage') ||
+      lower.includes('in promo') ||
+      lower.includes('stage rig') ||
+      lower.includes('during performance') ||
+      lower.includes('projecting from') ||
+      lower.includes('pulse to the beat') ||
+      lower.includes('crystalline') ||
+      (lower.includes('holographic') && lower.includes('cape'))
+    ) {
+      return false
+    }
+    return true
+  })
+
+  const result = filtered.join(' ').trim()
+  return result.length > 350 ? result.slice(0, 347) + '...' : result
+}
+
+/**
+ * Extract the most visually distinctive features from the Appearance section.
+ * These are placed at the FRONT of the prompt so image models prioritize them.
+ * Focuses on: hair color/style, eye color, skin tone, and unique markings.
+ */
+function extractKeyVisualTraits(identity: string): string {
+  const appearanceMatch = identity.match(/##\s*Appearance\s*\n([\s\S]*?)(?=\n##\s|\n---|$)/i)
+  if (!appearanceMatch) return ''
+
+  const text = appearanceMatch[1]
+  const traits: string[] = []
+
+  // Extract hair description (color + style are the most visually impactful)
+  const hairPatterns = [
+    /(?:hair|hair color)[^.]*(?:black|blonde|brunette|red|silver|lavender|pink|blue|purple|white|platinum|auburn|copper|ombre|gradient|holographic)[^.]*\./gi,
+    /(?:black|blonde|brunette|red|silver|lavender|pink|blue|purple|white|platinum|auburn|copper)[^.]*hair[^.]*/gi,
+    /(?:sleek|long|short|waist-length|shoulder-length|cropped)[^.]*hair[^.]*/gi,
+  ]
+  for (const pattern of hairPatterns) {
+    const match = text.match(pattern)
+    if (match) {
+      traits.push(match[0].trim().replace(/\.$/, ''))
+      break // only first hair match
+    }
+  }
+
+  // Extract eye description
+  const eyePatterns = [
+    /(?:eyes?|pupils?)[^.]*(?:brown|blue|green|hazel|amber|crimson|violet|heterochromia|feline|almond|dark)[^.]*/gi,
+    /(?:brown|blue|green|hazel|amber|crimson|violet|feline|sharp|dark almond)[^.]*eyes?[^.]*/gi,
+  ]
+  for (const pattern of eyePatterns) {
+    const match = text.match(pattern)
+    if (match) {
+      traits.push(match[0].trim().replace(/\.$/, ''))
+      break
+    }
+  }
+
+  // Extract skin description
+  const skinMatch = text.match(/(?:skin|complexion)[^.]*(?:pale|dark|tan|sun-kissed|luminous|warm|olive|fair|ebony|porcelain)[^.]*/i)
+    ?? text.match(/(?:pale|dark|tan|sun-kissed|luminous|warm|olive|fair|ebony|porcelain)[^.]*skin[^.]*/i)
+  if (skinMatch) {
+    traits.push(skinMatch[0].trim().replace(/\.$/, ''))
+  }
+
+  // Extract distinctive markings (tattoos, scars, beauty marks, piercings, vitiligo)
+  const markingPatterns = [
+    /tattoo[^.]*/gi,
+    /beauty mark[^.]*/gi,
+    /vitiligo[^.]*/gi,
+    /scar[^.]*/gi,
+    /piercing[^.]*/gi,
+    /marking[^.]*/gi,
+    /seal[^.]*/gi,
+  ]
+  for (const pattern of markingPatterns) {
+    const match = text.match(pattern)
+    if (match) {
+      traits.push(match[0].trim().replace(/\.$/, ''))
+    }
+  }
+
+  return traits.join(', ')
+}
+
+/**
  * Extract context from BOTH the user's message and LLM response to build a rich selfie prompt.
  * Uses conversation context to determine scene, outfit, activity, and time of day.
+ * Incorporates the character's appearance from IDENTITY.md so the selfie matches their look.
+ *
+ * @param currentActivity — When provided by the ActivityManager, this overrides
+ *   the text-based activity guessing so the selfie matches the displayed status.
  */
-function extractSelfieContext(userMessage: string, llmResponse: string, characterName: string): string {
+function extractSelfieContext(userMessage: string, llmResponse: string, characterName: string, identity?: string, timezone?: string, currentActivity?: string): string {
   const combined = `${userMessage} ${llmResponse}`.toLowerCase()
 
-  // Extract time/setting context
-  const timeContext = extractTimeContext(combined)
+  // Extract time/setting context — use character's timezone for accurate lighting
+  const timeContext = extractTimeContext(combined, timezone)
   const locationContext = extractLocationContext(combined)
-  const outfitContext = extractOutfitContext(combined)
-  const activityContext = extractActivityContext(combined)
+  // Pass identity so outfit picks from the character's actual wardrobe
+  const outfitContext = extractOutfitContext(combined, identity)
+
+  // When a real activity is available from the ActivityManager, use it instead of
+  // guessing from conversation text. This ensures the selfie matches the status display.
+  const activityContext = currentActivity
+    ? activityToSelfieContext(currentActivity)
+    : extractActivityContext(combined)
+
+  // Extract key visual traits (hair/eye color, markings) — these go FIRST for prominence
+  const keyTraits = identity ? extractKeyVisualTraits(identity) : ''
+  // Extract broader appearance context
+  const appearanceDesc = identity ? extractAppearanceFromIdentity(identity) : ''
 
   const parts = [
     `selfie of ${characterName}`,
-    outfitContext,
-    locationContext,
-    activityContext,
-    timeContext,
-  ].filter(Boolean)
+  ]
+
+  // Key visual traits go first — image models weight early tokens more heavily
+  if (keyTraits) {
+    parts.push(keyTraits)
+  }
+
+  // Broader appearance context follows
+  if (appearanceDesc) {
+    parts.push(`(character appearance: ${appearanceDesc})`)
+  }
+
+  parts.push(
+    ...[outfitContext, locationContext, activityContext, timeContext].filter(Boolean)
+  )
 
   // Append user's original description as supplementary context
   if (userMessage.length > 10) {
@@ -721,11 +1140,67 @@ function extractSelfieContext(userMessage: string, llmResponse: string, characte
   return parts.join(', ')
 }
 
-function extractTimeContext(text: string): string {
-  if (/sleep|bed|night|晚安|睡觉|困了|sleepy|tired|exhausted/.test(text)) return 'nighttime, soft warm lamp lighting, cozy bedroom atmosphere'
+/**
+ * Convert a real ActivityManager activity description into a selfie-appropriate
+ * visual context string for the image generator.
+ */
+function activityToSelfieContext(activity: string): string {
+  const lower = activity.toLowerCase()
+
+  if (/league|gaming|game|playing/.test(lower)) return 'at gaming desk, headset on, screen glow, gaming setup visible'
+  if (/listening|spotify|music|track/.test(lower)) return 'wearing earbuds, vibing to music, relaxed expression'
+  if (/watching|netflix|drama|youtube|video/.test(lower)) return 'screen glow on face, watching something, cozy'
+  if (/browsing|scrolling|pinterest|reddit|twitter/.test(lower)) return 'casually scrolling phone, relaxed'
+  if (/cooking|food|eating|dinner|lunch|breakfast/.test(lower)) return 'in kitchen, food visible'
+  if (/coffee|tea|matcha|drink/.test(lower)) return 'holding a warm drink'
+  if (/reading|book/.test(lower)) return 'with a book nearby, reading'
+  if (/studying|homework|notes/.test(lower)) return 'studying, books and notes around'
+  if (/sketch|draw|paint|art/.test(lower)) return 'sketching or drawing, art supplies visible'
+  if (/gym|boxing|exercise|workout/.test(lower)) return 'at gym, athletic setting, workout gear'
+  if (/shopping|thrift|store/.test(lower)) return 'out shopping, browsing racks'
+  if (/sleeping|zzz|passed out|dreaming/.test(lower)) return 'in bed, sleepy, cozy blankets'
+
+  // Fallback: use the activity description directly as visual context
+  return activity
+}
+
+/**
+ * Compute time-of-day lighting context from a timezone string.
+ * Uses the character's local time to determine appropriate lighting.
+ */
+function getTimeOfDayFromTimezone(timezone: string): string {
+  let hour: number
+  try {
+    const hourStr = new Date().toLocaleString('en-US', {
+      timeZone: timezone,
+      hour: 'numeric',
+      hour12: false,
+    })
+    hour = parseInt(hourStr, 10)
+  } catch {
+    hour = new Date().getHours()
+  }
+
+  if (hour >= 6 && hour < 9) return 'early morning, soft golden sunrise light'
+  if (hour >= 9 && hour < 12) return 'morning, bright natural daylight'
+  if (hour >= 12 && hour < 15) return 'afternoon, warm sunlight'
+  if (hour >= 15 && hour < 18) return 'late afternoon, golden hour warm glow'
+  if (hour >= 18 && hour < 21) return 'evening, warm indoor lighting, sunset tones'
+  if (hour >= 21 || hour < 1) return 'nighttime, warm lamp lighting, dim cozy ambiance'
+  return 'late night, dim soft lighting, dark outside'
+}
+
+function extractTimeContext(text: string, timezone?: string): string {
+  // Explicit conversation keywords override timezone-based calculation
+  if (/sleep|bed|night|晚安|睡觉|困了|sleepy|tired|exhausted|黑|dark|midnight|凌晨|深夜|半夜|路灯|月光|moonlight|streetlight/.test(text)) return 'nighttime, soft warm lamp lighting, cozy bedroom atmosphere'
   if (/morning|wake|早上|起床|just woke/.test(text)) return 'early morning, soft natural window light, just woke up'
   if (/afternoon|lunch|中午|下午/.test(text)) return 'afternoon, bright natural daylight'
   if (/evening|sunset|晚上|傍晚|dinner/.test(text)) return 'evening, golden hour warm lighting'
+
+  // No explicit time keywords — use character's actual timezone for accurate lighting
+  if (timezone) {
+    return getTimeOfDayFromTimezone(timezone)
+  }
   return 'natural lighting'
 }
 
@@ -759,7 +1234,53 @@ function extractLocationContext(text: string): string {
   return ''
 }
 
-function extractOutfitContext(text: string): string {
+/**
+ * Extract outfit descriptions from the character's Appearance section in IDENTITY.md.
+ * Parses "on stage" / "off stage" / "Her style is" blocks and clothing descriptions.
+ * Returns an array of outfit strings the character actually wears.
+ */
+function extractCharacterOutfits(identity: string): string[] {
+  const appearanceMatch = identity.match(/##\s*Appearance\s*\n([\s\S]*?)(?=\n##\s|\n---|$)/i)
+  if (!appearanceMatch) return []
+
+  const appearanceText = appearanceMatch[1]
+  const outfits: string[] = []
+
+  // Match labeled outfit blocks: "On stage:", "Off stage:", "In promo:", etc.
+  const labeledOutfitPattern = /(?:on[- ]?stage|off[- ]?stage|off[- ]?duty|in promo|performing|casual(?:ly)?)[^:]*:\s*([^\n]+)/gi
+  let labelMatch: RegExpExecArray | null
+  while ((labelMatch = labeledOutfitPattern.exec(appearanceText)) !== null) {
+    const outfitDesc = labelMatch[1].trim()
+    if (outfitDesc.length > 5) {
+      outfits.push(outfitDesc)
+    }
+  }
+
+  // Match "Her style is..." / "She dresses like..." / "Wears..." sentences
+  // Exclude "wears makeup" and "never wears" false positives
+  const stylePatterns = [
+    /(?:her )?style is ([^.\n]+)/gi,
+    /(?:she )?dresses? like ([^.\n]+)/gi,
+    /(?:she )?wears? (?!makeup|no )([^.\n]{10,150})/gi,
+  ]
+  for (const pattern of stylePatterns) {
+    let styleMatch: RegExpExecArray | null
+    while ((styleMatch = pattern.exec(appearanceText)) !== null) {
+      const desc = styleMatch[1].trim()
+      // Skip if preceded by "never" or "doesn't" (negation)
+      const precedingText = appearanceText.slice(Math.max(0, styleMatch.index - 10), styleMatch.index).toLowerCase()
+      if (/never|doesn'?t|don'?t|no\s/.test(precedingText)) continue
+      if (desc.length > 10 && desc.length < 200) {
+        outfits.push(desc)
+      }
+    }
+  }
+
+  return outfits
+}
+
+function extractOutfitContext(text: string, identity?: string): string {
+  // First check if the user/LLM explicitly mentioned a specific outfit in conversation
   if (/bikini|比基尼/.test(text)) return 'wearing a stylish bikini'
   if (/swimsuit|swimwear|泳衣|泳装/.test(text)) return 'wearing a swimsuit'
   if (/crop.?top|露脐/.test(text)) return 'wearing a crop top'
@@ -771,18 +1292,29 @@ function extractOutfitContext(text: string): string {
   if (/coat|大衣|风衣/.test(text)) return 'wearing a coat'
   if (/tank.?top|背心|吊带/.test(text)) return 'wearing a tank top'
   if (/jeans|牛仔裤/.test(text)) return 'wearing jeans'
-  if (/pajama|pj|睡衣|sleep|bed|sleepy|nightgown/.test(text)) return 'wearing comfortable pajamas'
-  if (/hoodie|卫衣/.test(text)) return 'wearing a cozy hoodie'
+  if (/pajama|pj|睡衣|nightgown/.test(text)) return 'wearing comfortable pajamas'
   if (/dress|裙子|连衣裙/.test(text)) return 'wearing a cute dress'
   if (/workout|gym|sport|运动/.test(text)) return 'wearing athletic wear'
   if (/suit|formal|正装/.test(text)) return 'dressed formally'
   if (/towel|bath|浴巾/.test(text)) return 'wrapped in a towel, fresh from shower'
-  if (/oversized|t-shirt|tee|T恤/.test(text)) return 'wearing an oversized t-shirt'
   if (/sweater|毛衣/.test(text)) return 'wearing a soft sweater'
-  // Don't default to hoodie - pick something contextual
-  if (/morning|wake|just woke/.test(text)) return 'wearing comfortable sleepwear'
+
+  // Time-of-day sleepwear (always takes priority over wardrobe)
+  if (/morning|wake|just woke|sleep|bed|sleepy/.test(text)) return 'wearing comfortable sleepwear'
+
+  // If we have character identity, pick from their actual wardrobe instead of defaulting
+  if (identity) {
+    const characterOutfits = extractCharacterOutfits(identity)
+    if (characterOutfits.length > 0) {
+      const idx = Math.floor(Math.random() * characterOutfits.length)
+      return `wearing ${characterOutfits[idx]}`
+    }
+  }
+
+  // No character wardrobe available — minimal fallback (empty string lets
+  // the appearance description from IDENTITY.md speak for itself)
   if (/night|evening|relax|chill/.test(text)) return 'in comfortable loungewear'
-  return 'casually dressed'
+  return ''
 }
 
 function extractActivityContext(text: string): string {
@@ -856,11 +1388,19 @@ function extractSceneContext(userMessage: string, llmResponse: string, character
 
   // Determine the scene subject from context
   if (/window|view|outside|窗/.test(combined)) {
-    parts.push('view from a cozy apartment window')
-    if (/haz[ey]|fog|mist/.test(combined)) parts.push('slightly hazy atmosphere')
-    if (/tree|bloom|flower/.test(combined)) parts.push('trees visible outside')
-    if (/city|urban|building/.test(combined)) parts.push('city skyline in the distance')
-    else parts.push('peaceful neighborhood view')
+    const isNight = /night|黑|dark|midnight|凌晨|深夜|半夜|路灯|月光|moonlight|streetlight|晚上/.test(combined)
+    if (isNight) {
+      parts.push('nighttime view from apartment window, dark sky')
+      if (/路灯|streetlight|street.?light/.test(combined)) parts.push('dim streetlights below')
+      if (/月|moon/.test(combined)) parts.push('moonlight visible')
+      parts.push('city lights in the distance, quiet night atmosphere')
+    } else {
+      parts.push('view from a cozy apartment window')
+      if (/haz[ey]|fog|mist/.test(combined)) parts.push('slightly hazy atmosphere')
+      if (/tree|bloom|flower/.test(combined)) parts.push('trees visible outside')
+      if (/city|urban|building/.test(combined)) parts.push('city skyline in the distance')
+      else parts.push('peaceful neighborhood view')
+    }
   } else if (/matcha|coffee|tea|drink|cup/.test(combined)) {
     parts.push('aesthetic matcha latte on a wooden table')
     parts.push('cozy cafe ambiance')
@@ -908,4 +1448,107 @@ function inferSelfieStyle(userMessage: string, llmResponse: string): string {
   if (/outside|park|beach|street|travel|cafe|restaurant|外面|公园|咖啡/.test(combined)) return 'location'
   if (/close|face|eyes|cute|脸|眼睛/.test(combined)) return 'close-up'
   return 'casual'
+}
+
+/**
+ * Align an image prompt with a voice message to ensure visual coherence.
+ *
+ * When the LLM outputs BOTH [SELFIE: ...] and [VOICE: ...], they might
+ * describe different scenes because the LLM generates them independently.
+ * Even when they match at the LLM level, the image generation model may
+ * ignore the scene context if it's buried under generic style tokens.
+ *
+ * This function:
+ * 1. Extracts scene keywords from the voice text (location, activity, objects, time)
+ * 2. Checks if the image prompt already contains those keywords
+ * 3. If keywords are missing, prepends a coherence hint derived from the voice text
+ *    so the image model generates a scene matching what the voice describes
+ *
+ * Returns the original prompt unchanged if already coherent, or an enriched prompt.
+ */
+function alignImagePromptWithVoice(
+  imagePrompt: string,
+  voiceText: string
+): string {
+  const voiceLower = voiceText.toLowerCase()
+  const imageLower = imagePrompt.toLowerCase()
+
+  // Extract scene-relevant keywords from voice text.
+  // These are concrete nouns, locations, activities, and objects that
+  // define what the user will "see" in the photo vs "hear" in the voice.
+  const scenePatterns: Array<{ pattern: RegExp; keyword: string }> = [
+    // Locations
+    { pattern: /\bkitchen\b/, keyword: 'kitchen' },
+    { pattern: /\bbedroom\b/, keyword: 'bedroom' },
+    { pattern: /\bliving room\b/, keyword: 'living room' },
+    { pattern: /\bbathroom\b/, keyword: 'bathroom' },
+    { pattern: /\bbalcony\b/, keyword: 'balcony' },
+    { pattern: /\bcouch\b|\bsofa\b/, keyword: 'couch' },
+    { pattern: /\bbed\b/, keyword: 'bed' },
+    { pattern: /\bdesk\b/, keyword: 'desk' },
+    { pattern: /\bcafe\b|\bcoffee\s*shop\b/, keyword: 'cafe' },
+    { pattern: /\brestaurant\b/, keyword: 'restaurant' },
+    { pattern: /\bpark\b/, keyword: 'park' },
+    { pattern: /\bbeach\b/, keyword: 'beach' },
+    { pattern: /\bgym\b/, keyword: 'gym' },
+    { pattern: /\bstudio\b/, keyword: 'studio' },
+    { pattern: /\boffice\b/, keyword: 'office' },
+    { pattern: /\bcar\b|\bdriving\b/, keyword: 'car' },
+    { pattern: /\btrain\b|\bsubway\b|\bmetro\b/, keyword: 'train' },
+    { pattern: /\bpool\b|\bswimming\b/, keyword: 'pool' },
+    { pattern: /\bgarden\b|\byard\b/, keyword: 'garden' },
+    { pattern: /\brooftop\b/, keyword: 'rooftop' },
+    { pattern: /\bmountain\b|\bhiking\b/, keyword: 'mountain' },
+    // Activities
+    { pattern: /\bcook(?:ing)?\b/, keyword: 'cooking' },
+    { pattern: /\bcoffee\b/, keyword: 'coffee' },
+    { pattern: /\btea\b(?!m)/, keyword: 'tea' },
+    { pattern: /\breakfast\b/, keyword: 'breakfast' },
+    { pattern: /\blunch\b/, keyword: 'lunch' },
+    { pattern: /\bdinner\b/, keyword: 'dinner' },
+    { pattern: /\breading\b|\bbook\b/, keyword: 'reading a book' },
+    { pattern: /\bpainting\b|\bdrawing\b/, keyword: 'painting' },
+    { pattern: /\bwork(?:ing)?\s*out\b|\bexercis(?:e|ing)\b/, keyword: 'working out' },
+    { pattern: /\byoga\b/, keyword: 'yoga' },
+    { pattern: /\bwalk(?:ing)?\b/, keyword: 'walking' },
+    { pattern: /\brun(?:ning)?\b/, keyword: 'running' },
+    { pattern: /\bshopping\b/, keyword: 'shopping' },
+    { pattern: /\bgaming\b|\bplaying games?\b/, keyword: 'gaming' },
+    // Time of day
+    { pattern: /\bmorning\b|\bjust woke\b|\bwoke up\b/, keyword: 'morning' },
+    { pattern: /\bnight\b|\bbedtime\b|\bsleepy\b/, keyword: 'nighttime' },
+    { pattern: /\bsunset\b/, keyword: 'sunset' },
+    { pattern: /\bsunrise\b|\bdawn\b/, keyword: 'sunrise' },
+    // Objects / props
+    { pattern: /\bmug\b|\bcup\b/, keyword: 'holding a mug' },
+    { pattern: /\bheadphones\b|\bearbuds\b/, keyword: 'wearing headphones' },
+    { pattern: /\bphone\b|\bscrolling\b/, keyword: 'holding phone' },
+    { pattern: /\blaptop\b|\bcomputer\b/, keyword: 'laptop nearby' },
+    { pattern: /\bblanket\b/, keyword: 'wrapped in blanket' },
+    { pattern: /\bhoodie\b/, keyword: 'wearing hoodie' },
+    { pattern: /\bpajamas?\b|\bpjs?\b/, keyword: 'wearing pajamas' },
+  ]
+
+  const missingKeywords: string[] = []
+  for (const { pattern, keyword } of scenePatterns) {
+    if (pattern.test(voiceLower) && !imageLower.includes(keyword)) {
+      missingKeywords.push(keyword)
+    }
+  }
+
+  // If no scene keywords are missing, the prompts are already coherent
+  if (missingKeywords.length === 0) {
+    return imagePrompt
+  }
+
+  // Cap at 5 keywords to avoid bloating the prompt
+  const hints = missingKeywords.slice(0, 5)
+  const coherencePrefix = `(scene context from voice: ${hints.join(', ')})`
+
+  debugLog(
+    `[Engine] Voice-image coherence: adding ${hints.length} missing keywords: ${hints.join(', ')}`
+  )
+
+  // Prepend coherence hint so the image model sees it early in the prompt
+  return `${coherencePrefix}, ${imagePrompt}`
 }

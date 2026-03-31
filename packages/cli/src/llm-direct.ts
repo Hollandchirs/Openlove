@@ -11,11 +11,14 @@
 export type CliProvider =
   | 'anthropic'
   | 'openai'
+  | 'xai'
   | 'deepseek'
   | 'qwen'
   | 'kimi'
   | 'zhipu'
   | 'minimax'
+  | 'minimax-global'
+  | 'zai'
   | 'ollama'
 
 interface ProviderMeta {
@@ -25,12 +28,15 @@ interface ProviderMeta {
 
 export const PROVIDER_META: Record<string, ProviderMeta> = {
   openai:   { baseURL: '',                                                   defaultModel: 'gpt-4o-mini' },
+  xai:      { baseURL: 'https://api.x.ai/v1',                               defaultModel: 'grok-4-1-fast-non-reasoning' },
   deepseek: { baseURL: 'https://api.deepseek.com',                          defaultModel: 'deepseek-chat' },
   qwen:     { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1', defaultModel: 'qwen-max' },
   kimi:     { baseURL: 'https://api.moonshot.cn/v1',                        defaultModel: 'moonshot-v1-8k' },
   zhipu:    { baseURL: 'https://open.bigmodel.cn/api/paas/v4',              defaultModel: 'glm-4-flash' },
-  minimax:  { baseURL: 'https://api.minimax.chat/v1',                       defaultModel: 'abab6.5s-chat' },
-  ollama:   { baseURL: 'http://localhost:11434/v1',                          defaultModel: 'qwen2.5:7b' },
+  minimax:          { baseURL: 'https://api.minimaxi.com/v1',               defaultModel: 'MiniMax-Text-01' },
+  'minimax-global': { baseURL: 'https://api.minimax.io/v1',                defaultModel: 'MiniMax-Text-01' },
+  zai:              { baseURL: 'https://api.lingyiwanwu.com/v1',           defaultModel: 'yi-lightning' },
+  ollama:           { baseURL: 'http://localhost:11434/v1',                 defaultModel: 'qwen2.5:7b' },
 }
 
 export interface Message {
@@ -120,7 +126,7 @@ export const PROVIDER_INFO: ProviderInfo[] = [
   },
   {
     id: 'qwen',
-    name: '通义千问 Qwen',
+    name: 'Qwen (Alibaba)',
     emoji: '🌟',
     tagline: 'Alibaba — stable, multilingual, strong Chinese',
     taglineCN: '阿里出品，稳定可靠，中英双强',
@@ -144,7 +150,7 @@ export const PROVIDER_INFO: ProviderInfo[] = [
   },
   {
     id: 'zhipu',
-    name: '智谱 GLM',
+    name: 'GLM (Zhipu AI)',
     emoji: '🔵',
     tagline: 'Tsinghua-backed, bilingual, free tier available',
     taglineCN: '清华系，中英双强，有免费额度',
@@ -156,13 +162,37 @@ export const PROVIDER_INFO: ProviderInfo[] = [
   },
   {
     id: 'minimax',
-    name: 'MiniMax',
+    name: 'MiniMax (China)',
     emoji: '💜',
-    tagline: 'Roleplay-optimized, character voice support',
+    tagline: 'Roleplay-optimized, character voice support — China API',
     taglineCN: '角色扮演优化，支持角色音色',
     keyUrl: 'https://platform.minimaxi.com/user-center/basic-information/interface-key',
     keyUrlCN: 'https://platform.minimaxi.com/user-center/basic-information/interface-key',
     envKey: 'MINIMAX_API_KEY',
+    requiresVPN: false,
+    isLocal: false,
+  },
+  {
+    id: 'minimax-global',
+    name: 'MiniMax (Global)',
+    emoji: '💜',
+    tagline: 'MiniMax global API — roleplay-optimized, English-first',
+    taglineCN: 'MiniMax 海外版，角色扮演优化',
+    keyUrl: 'https://intl.minimaxi.com',
+    keyUrlCN: 'https://intl.minimaxi.com',
+    envKey: 'MINIMAX_GLOBAL_API_KEY',
+    requiresVPN: true,
+    isLocal: false,
+  },
+  {
+    id: 'zai',
+    name: 'Zai (01.AI Yi)',
+    emoji: '🧠',
+    tagline: '01.AI Yi series — strong reasoning, multilingual',
+    taglineCN: '零一万物 Yi 系列，推理强，多语言',
+    keyUrl: 'https://platform.lingyiwanwu.com/apikeys',
+    keyUrlCN: 'https://platform.lingyiwanwu.com/apikeys',
+    envKey: 'ZAI_API_KEY',
     requiresVPN: false,
     isLocal: false,
   },
@@ -193,10 +223,22 @@ export const PROVIDER_INFO: ProviderInfo[] = [
     requiresVPN: true,
     isLocal: false,
   },
+  {
+    id: 'xai',
+    name: 'xAI (Grok)',
+    emoji: '⚡',
+    tagline: '$25 free credit on signup, fast reasoning',
+    taglineCN: '$25免费额度，推理快',
+    keyUrl: 'https://console.x.ai',
+    keyUrlCN: 'https://console.x.ai',
+    envKey: 'XAI_API_KEY',
+    requiresVPN: true,
+    isLocal: false,
+  },
   // ── Local ──
   {
     id: 'ollama',
-    name: 'Ollama (本地)',
+    name: 'Ollama (Local)',
     emoji: '🏠',
     tagline: 'Completely free, runs on your computer',
     taglineCN: '完全免费，本地运行，需要高性能电脑',

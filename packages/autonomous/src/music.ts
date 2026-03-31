@@ -14,6 +14,8 @@ export interface MusicConfig {
   // Genres/artists parsed from SOUL.md to use as seeds
   seedArtists?: string[]
   seedGenres?: string[]
+  /** Character-specific curated tracks (replaces generic fallback list) */
+  curatedTracks?: TrackInfo[]
 }
 
 export interface TrackInfo {
@@ -122,7 +124,14 @@ export class MusicEngine {
   }
 
   private pickCuratedTrack(): TrackInfo {
-    const curatedTracks: TrackInfo[] = [
+    // Use character-specific curated tracks if available
+    if (this.config.curatedTracks && this.config.curatedTracks.length > 0) {
+      const tracks = this.config.curatedTracks
+      return tracks[Math.floor(Math.random() * tracks.length)]
+    }
+
+    // Fallback: generic curated tracks
+    const genericTracks: TrackInfo[] = [
       { track: 'Cruel Summer', artist: 'Taylor Swift', emotion: 'energetic' },
       { track: 'Lover', artist: 'Taylor Swift', emotion: 'romantic' },
       { track: 'Blinding Lights', artist: 'The Weeknd', emotion: 'energetic' },
@@ -148,7 +157,7 @@ export class MusicEngine {
       track: 'a song I found', artist, emotion: 'chill' as const,
     }))
 
-    const allTracks = [...curatedTracks, ...customTracks]
+    const allTracks = [...genericTracks, ...customTracks]
     return allTracks[Math.floor(Math.random() * allTracks.length)]
   }
 }

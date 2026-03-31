@@ -33,16 +33,26 @@ function debugLog(msg: string): void {
   console.log(msg)
   try { appendFileSync(DEBUG_LOG, line) } catch { /* ignore */ }
 }
-import {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  VoiceConnectionStatus,
-  getVoiceConnection,
-  entersState,
-  EndBehaviorType,
-} from '@discordjs/voice'
+// Lazy-loaded voice module — optional dep, may not be installed (e.g. npx)
+let voice: typeof import('@discordjs/voice') | null = null
+let voiceLoadError: string | null = null
+
+async function loadVoice() {
+  if (voice) return voice
+  if (voiceLoadError) return null
+  try {
+    voice = await import('@discordjs/voice')
+    return voice
+  } catch (err) {
+    voiceLoadError = err instanceof Error ? err.message : String(err)
+    console.warn(`[Discord] @discordjs/voice not available — voice features disabled (${voiceLoadError})`)
+    return null
+  }
+}
+
+function getVoiceSync() {
+  return voice
+}
 import { ConversationEngine, OutgoingMessage } from '@opencrush/core'
 import { MediaEngine } from '@opencrush/media'
 import { Readable } from 'stream'
@@ -335,6 +345,10 @@ export class DiscordBridge {
   }
 
   private async handleVoiceState(oldState: VoiceState, newState: VoiceState): Promise<void> {
+    // Voice features require @discordjs/voice — skip if not available
+    const v = await loadVoice()
+    if (!v) return
+
     // Follow owner into voice channels
     if (newState.member?.id !== this.config.ownerId) return
 
@@ -376,7 +390,9 @@ export class DiscordBridge {
    * Creates a loop: listen → transcribe → LLM → TTS → speak → repeat.
    */
   private startVoiceConversation(guildId: string): void {
-    const connection = getVoiceConnection(guildId)
+    const v = getVoiceSync()
+    if (!v) return
+    const connection = v.getVoiceConnection(guildId)
     if (!connection) return
 
     this.voiceConversationActive.set(guildId, true)
@@ -394,7 +410,9 @@ export class DiscordBridge {
   private async listenForNextUtterance(guildId: string): Promise<void> {
     if (!this.voiceConversationActive.get(guildId)) return
 
-    const connection = getVoiceConnection(guildId)
+    const v = getVoiceSync()
+    if (!v) return
+    const connection = v.getVoiceConnection(guildId)
     if (!connection) return
 
     // Don't listen while we're speaking
@@ -409,7 +427,7 @@ export class DiscordBridge {
       // Subscribe to the owner's audio — ends after 1.5s of silence
       const opusStream = receiver.subscribe(this.config.ownerId, {
         end: {
-          behavior: EndBehaviorType.AfterSilence,
+          behavior: v.EndBehaviorType.AfterSilence,
           duration: 1500,
         },
       })
@@ -548,15 +566,17 @@ export class DiscordBridge {
     guildId: string,
     adapterCreator: any
   ): Promise<void> {
+    const v = getVoiceSync()
+    if (!v) return
     try {
-      const connection = joinVoiceChannel({
+      const connection = v.joinVoiceChannel({
         channelId,
         guildId,
         adapterCreator,
         selfDeaf: false,
         selfMute: false,
       })
-      await entersState(connection, VoiceConnectionStatus.Ready, 30_000)
+      await v.entersState(connection, v.VoiceConnectionStatus.Ready, 30_000)
       console.log(`[Discord] Joined voice channel ${channelId}`)
     } catch (err) {
       console.error('[Discord] Failed to join voice channel:', err)
@@ -564,7 +584,9 @@ export class DiscordBridge {
   }
 
   private leaveVoiceChannel(guildId: string): void {
-    const connection = getVoiceConnection(guildId)
+    const v = getVoiceSync()
+    if (!v) return
+    const connection = v.getVoiceConnection(guildId)
     if (connection) {
       connection.destroy()
       console.log(`[Discord] Left voice channel in guild ${guildId}`)
@@ -572,17 +594,19 @@ export class DiscordBridge {
   }
 
   private async playAudio(guildId: string, audioBuffer: Buffer): Promise<void> {
-    const connection = getVoiceConnection(guildId)
+    const v = getVoiceSync()
+    if (!v) return
+    const connection = v.getVoiceConnection(guildId)
     if (!connection) return
 
-    const player = createAudioPlayer()
+    const player = v.createAudioPlayer()
     const readable = Readable.from(audioBuffer)
-    const resource = createAudioResource(readable)
+    const resource = v.createAudioResource(readable)
 
     player.play(resource)
     connection.subscribe(player)
 
-    await entersState(player, AudioPlayerStatus.Idle, 60_000)
+    await v.entersState(player, v.AudioPlayerStatus.Idle, 60_000)
   }
 
   // ── Message Handling ───────────────────────────────────────
@@ -821,6 +845,8 @@ export class DiscordBridge {
   }
 
   async start(): Promise<void> {
+    // Eagerly try to load voice module so we warn at startup if missing
+    await loadVoice()
     await this.client.login(this.config.token)
   }
 

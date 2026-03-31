@@ -288,6 +288,7 @@ let browserAgentInstance: import('@opencrush/autonomous').BrowserAgent | null = 
 let lastSelfieTime = 0
 const SELFIE_COOLDOWN_MS = 3 * 60 * 1000 // 3 min cooldown between selfies
 let pendingActivityPrompt: string | null = null
+let activityTimerHandle: ReturnType<typeof setTimeout> | null = null
 
 /**
  * Activity prompts — instead of hardcoding browser.watchYouTube(), we give
@@ -410,12 +411,12 @@ function registerActivityService(
 
         const scheduleNext = () => {
           const nextMs = (20 + Math.random() * 40) * 60 * 1000
-          setTimeout(runLoop, nextMs)
+          activityTimerHandle = setTimeout(runLoop, nextMs)
         }
 
         // Start after boot delay
         const bootDelay = (2 + Math.random() * 3) * 60 * 1000
-        setTimeout(runLoop, bootDelay)
+        activityTimerHandle = setTimeout(runLoop, bootDelay)
 
         log('Activity service started — prompt-driven autonomous behavior active')
       } catch (err) {
@@ -423,6 +424,11 @@ function registerActivityService(
       }
     },
     async stop() {
+      // Cancel any pending scheduled timeout to prevent leaked timers
+      if (activityTimerHandle) {
+        clearTimeout(activityTimerHandle)
+        activityTimerHandle = null
+      }
       if (activityManagerInstance) {
         activityManagerInstance.stopActivity()
         activityManagerInstance = null

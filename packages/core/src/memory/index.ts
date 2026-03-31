@@ -290,11 +290,32 @@ export class MemorySystem {
    * Called after each exchange to build up long-term memory.
    * Only embeds messages that contain meaningful, memorable content.
    */
-  async consolidate(userMessage: string, assistantResponse: string): Promise<void> {
+  async consolidate(
+    userMessage: string,
+    assistantResponse: string,
+    options?: { skipAssistantSave?: boolean }
+  ): Promise<void> {
     // Store the exchange in working memory (always — this is the raw log)
     const now = Date.now()
     this.addMessage({ role: 'user', content: userMessage, timestamp: now })
-    this.addMessage({ role: 'assistant', content: assistantResponse, timestamp: now + 1 })
+
+    // When a media action (send_image/send_voice) is present, the generate-image or
+    // generate-voice route will write the canonical media message to the DB.
+    // Saving the assistant's text reply here too would create a duplicate message
+    // (one text + one [image:url]) per selfie request.
+    // skipAssistantSave=true tells us to skip the text save entirely.
+    if (!options?.skipAssistantSave) {
+      // Only store assistant text if it contains meaningful content — media-only responses
+      // (where the entire message was a [SELFIE:] / [IMAGE:] tag) are saved separately by
+      // generate-image/generate-voice. After tag stripping, the remaining text may be empty,
+      // whitespace-only, or just punctuation fragments (e.g. "~", "!", "...").
+      // Storing these creates phantom blank messages that show on page refresh.
+      const meaningfulText = assistantResponse
+        .replace(/[\s~!?.…*_\-–—]+/g, '')  // strip whitespace, punctuation, markdown emphasis
+      if (meaningfulText.length > 0) {
+        this.addMessage({ role: 'assistant', content: assistantResponse, timestamp: now + 1 })
+      }
+    }
 
     // Only embed into semantic memory if the message is worth remembering
     if (isWorthEmbedding(userMessage, assistantResponse)) {

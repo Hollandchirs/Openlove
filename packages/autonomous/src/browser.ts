@@ -2,7 +2,7 @@
  * Browser Agent
  *
  * Uses Playwright to simulate the AI character "living" on the computer.
- * Opens real browser windows to watch YouTube, listen to Spotify, browse the web.
+ * Opens real browser windows to watch YouTube, listen to YouTube Music, browse the web.
  *
  * Three launch modes (in priority order):
  *   1. CDP — connect to user's running Chrome (has real login sessions)
@@ -13,10 +13,24 @@
  *
  * Falls back gracefully if Playwright is not installed — activities still
  * update Discord presence even without a real browser.
+ *
+ * Stability features:
+ *   - Page lifecycle monitoring (crash, close, disconnect detection)
+ *   - Automatic page recovery on failure
+ *   - Health-checked isAvailable() with real connectivity test
+ *   - Consecutive failure tracking with circuit breaker
+ *   - Increased navigation timeouts (30s) for real-world sites
  */
 
 import { join } from 'path'
-import { mkdirSync } from 'fs'
+import { mkdirSync, appendFileSync } from 'fs'
+
+function debugLog(msg: string): void {
+  const ts = new Date().toISOString()
+  const line = `[${ts}] ${msg}\n`
+  console.log(msg)
+  try { appendFileSync('/tmp/opencrush-debug.log', line) } catch { /* ignore */ }
+}
 
 let playwright: typeof import('playwright') | null = null
 
@@ -38,6 +52,12 @@ type Page = Awaited<ReturnType<Browser['newPage']>>
 
 export type BrowserMode = 'cdp' | 'persistent' | 'fresh' | 'chrome'
 
+/** Navigation timeout — 30s is more realistic for social media sites */
+const NAV_TIMEOUT = 30_000
+
+/** Max consecutive failures before circuit breaker disables browser */
+const MAX_CONSECUTIVE_FAILURES = 5
+
 export interface BrowserConfig {
   /** Launch mode: 'cdp' | 'persistent' | 'fresh' | 'chrome' (default: auto-detect) */
   mode?: BrowserMode
@@ -56,6 +76,13 @@ export class BrowserAgent {
   private available = false
   private config: BrowserConfig
   private mode: BrowserMode = 'fresh'
+
+  /** Tracks consecutive navigation failures for circuit breaker */
+  private consecutiveFailures = 0
+  /** True when page has been detected as dead (crash/close/disconnect) */
+  private pageIsDead = false
+  /** Last known good page info — updated on every successful navigation */
+  private lastPageInfo: { title: string; url: string; site?: string } | null = null
 
   constructor(config: BrowserConfig = {}) {
     this.config = config
@@ -107,9 +134,90 @@ export class BrowserAgent {
   }
 
   /**
+   * Attach lifecycle event handlers to detect page crashes and disconnects.
+   * When a page dies, we mark it immediately so isAvailable() returns false.
+   */
+  private attachPageLifecycleHandlers(): void {
+    if (!this.page) return
+
+    this.page.on('close', () => {
+      console.warn('[Browser] Page closed unexpectedly')
+      this.markPageDead()
+    })
+
+    this.page.on('crash', () => {
+      console.error('[Browser] Page crashed!')
+      this.markPageDead()
+    })
+
+    // Monitor browser-level disconnect
+    if (this.browser) {
+      this.browser.on('disconnected', () => {
+        console.error('[Browser] Browser disconnected!')
+        this.markPageDead()
+      })
+    }
+    if (this.context) {
+      this.context.on('close', () => {
+        console.warn('[Browser] Browser context closed')
+        this.markPageDead()
+      })
+    }
+  }
+
+  private markPageDead(): void {
+    this.pageIsDead = true
+    this.available = false
+    this.page = undefined
+  }
+
+  /**
+   * Try to recover from a dead page by creating a new one.
+   * Returns true if recovery succeeded.
+   */
+  async tryRecoverPage(): Promise<boolean> {
+    if (!this.pageIsDead) return true
+    console.log('[Browser] Attempting page recovery...')
+
+    try {
+      if (this.mode === 'cdp' && this.browser) {
+        const contexts = this.browser.contexts()
+        if (contexts.length > 0) {
+          this.page = await contexts[0].newPage()
+        } else {
+          this.page = await this.browser.newPage()
+        }
+      } else if (this.context) {
+        this.page = await this.context.newPage()
+      } else if (this.browser) {
+        this.page = await this.browser.newPage()
+      } else {
+        // No browser/context — need full relaunch
+        console.warn('[Browser] No browser instance — attempting full relaunch')
+        const success = await this.launch()
+        return success
+      }
+
+      this.pageIsDead = false
+      this.available = true
+      this.consecutiveFailures = 0
+      this.attachPageLifecycleHandlers()
+      console.log('[Browser] Page recovered successfully')
+      return true
+    } catch (err) {
+      console.error('[Browser] Page recovery failed:', err)
+      // Full relaunch as last resort
+      try {
+        const success = await this.launch()
+        return success
+      } catch {
+        return false
+      }
+    }
+  }
+
+  /**
    * CDP mode: Connect to user's running Chrome instance.
-   * User must start Chrome with: --remote-debugging-port=9222
-   * Provides access to all logged-in sessions (YouTube, Spotify, etc.)
    */
   private async tryLaunchCDP(pw: typeof import('playwright')): Promise<boolean> {
     const endpoint = this.config.cdpEndpoint ?? 'http://localhost:9222'
@@ -122,7 +230,10 @@ export class BrowserAgent {
         this.page = await this.browser.newPage()
       }
       this.available = true
+      this.pageIsDead = false
+      this.consecutiveFailures = 0
       this.mode = 'cdp'
+      this.attachPageLifecycleHandlers()
       console.log(`[Browser] Connected to Chrome via CDP (${endpoint}) — real login sessions available`)
       return true
     } catch {
@@ -133,8 +244,6 @@ export class BrowserAgent {
 
   /**
    * Persistent profile mode: Launch Chromium with a dedicated user data directory.
-   * Cookies and login sessions are preserved between restarts.
-   * User logs in once through the browser, stays logged in forever.
    */
   private async tryLaunchPersistent(pw: typeof import('playwright')): Promise<boolean> {
     const profileDir = this.config.profileDir
@@ -153,7 +262,10 @@ export class BrowserAgent {
       })
       this.page = this.context.pages()[0] ?? await this.context.newPage()
       this.available = true
+      this.pageIsDead = false
+      this.consecutiveFailures = 0
       this.mode = 'persistent'
+      this.attachPageLifecycleHandlers()
       console.log(`[Browser] Launched with persistent profile at ${profileDir} — logins will be saved`)
       return true
     } catch (err) {
@@ -163,9 +275,7 @@ export class BrowserAgent {
   }
 
   /**
-   * Chrome mode: Launch the user's real Google Chrome (not Chromium) with a
-   * dedicated profile directory. This avoids Google's "unsafe browser" block
-   * because it uses the real Chrome binary. Logins are saved in the profile.
+   * Chrome mode: Launch the user's real Google Chrome with a dedicated profile.
    */
   private async tryLaunchChrome(pw: typeof import('playwright')): Promise<boolean> {
     const profileDir = this.config.profileDir
@@ -185,7 +295,10 @@ export class BrowserAgent {
       })
       this.page = this.context.pages()[0] ?? await this.context.newPage()
       this.available = true
+      this.pageIsDead = false
+      this.consecutiveFailures = 0
       this.mode = 'chrome'
+      this.attachPageLifecycleHandlers()
       console.log(`[Browser] Launched real Google Chrome with profile at ${profileDir}`)
       return true
     } catch (err) {
@@ -205,7 +318,10 @@ export class BrowserAgent {
       })
       this.page = await this.browser.newPage()
       this.available = true
+      this.pageIsDead = false
+      this.consecutiveFailures = 0
       this.mode = 'fresh'
+      this.attachPageLifecycleHandlers()
       console.log('[Browser] Launched fresh Chromium (no saved logins)')
       return true
     } catch (err) {
@@ -215,7 +331,13 @@ export class BrowserAgent {
     }
   }
 
+  /**
+   * Health-checked availability: verifies page is actually alive,
+   * not just that the reference exists in memory.
+   */
   isAvailable(): boolean {
+    if (this.pageIsDead) return false
+    if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return false
     return this.available && !!this.page
   }
 
@@ -223,12 +345,63 @@ export class BrowserAgent {
     return this.mode
   }
 
+  /** Get the last known page info (updated on every successful navigation). */
+  getLastPageInfo(): { title: string; url: string; site?: string } | null {
+    return this.lastPageInfo
+  }
+
+  /** Reset the circuit breaker (called after successful recovery). */
+  resetFailures(): void {
+    this.consecutiveFailures = 0
+  }
+
+  /**
+   * Safe navigation wrapper — handles errors, tracks failures, attempts recovery.
+   * Returns the page title on success, null on failure.
+   */
+  private async safeNavigate(url: string): Promise<{ title: string } | null> {
+    // Try to recover dead page before navigating
+    if (this.pageIsDead) {
+      const recovered = await this.tryRecoverPage()
+      if (!recovered) return null
+    }
+    if (!this.page) return null
+
+    try {
+      await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+      const title = await this.page.title()
+      // Success — reset failure counter and update last known info
+      this.consecutiveFailures = 0
+      this.lastPageInfo = { title, url }
+      return { title }
+    } catch (err) {
+      this.consecutiveFailures++
+      const errMsg = err instanceof Error ? err.message : String(err)
+
+      // Detect fatal errors that mean the page/browser is dead
+      if (errMsg.includes('Target closed') || errMsg.includes('crashed') ||
+          errMsg.includes('disconnected') || errMsg.includes('Session closed') ||
+          errMsg.includes('handshake')) {
+        console.error(`[Browser] Fatal navigation error (${this.consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}): ${errMsg}`)
+        this.markPageDead()
+      } else {
+        console.warn(`[Browser] Navigation failed (${this.consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}): ${errMsg.slice(0, 120)}`)
+      }
+
+      // Circuit breaker
+      if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.error('[Browser] Circuit breaker tripped — disabling browser until recovery')
+      }
+
+      return null
+    }
+  }
+
   /**
    * Take a screenshot of the current page.
-   * Returns a PNG buffer, or null if unavailable.
    */
   async takeScreenshot(): Promise<Buffer | null> {
-    if (!this.page) return null
+    if (!this.page || this.pageIsDead) return null
 
     try {
       const buffer = await this.page.screenshot({ type: 'png' })
@@ -244,12 +417,11 @@ export class BrowserAgent {
    * Open YouTube and search for / watch a video.
    */
   async watchYouTube(query: string): Promise<{ title: string; url: string } | null> {
-    if (!this.page) return null
+    const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`
+    const result = await this.safeNavigate(searchUrl)
+    if (!result || !this.page) return null
 
     try {
-      const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`
-      await this.page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 })
-
       // Wait for video results to load, then click first one
       await this.page.waitForSelector('ytd-video-renderer', { timeout: 10000 })
       const firstVideo = this.page.locator('ytd-video-renderer a#thumbnail').first()
@@ -259,9 +431,11 @@ export class BrowserAgent {
       await this.page.waitForLoadState('domcontentloaded')
       const title = await this.page.title()
       const url = this.page.url()
+      const cleanTitle = title.replace(' - YouTube', '')
 
-      console.log(`[Browser] Watching YouTube: ${title}`)
-      return { title: title.replace(' - YouTube', ''), url }
+      this.lastPageInfo = { title: cleanTitle, url, site: 'YouTube' }
+      console.log(`[Browser] Watching YouTube: ${cleanTitle}`)
+      return { title: cleanTitle, url }
     } catch (err) {
       console.error('[Browser] YouTube error:', err)
       return null
@@ -269,21 +443,45 @@ export class BrowserAgent {
   }
 
   /**
-   * Open Spotify Web Player and search for a track.
+   * Open YouTube Music and search for / play a track.
    */
-  async listenToSpotify(query: string): Promise<{ title: string } | null> {
-    if (!this.page) return null
+  async listenToMusic(query: string): Promise<{ title: string } | null> {
+    debugLog(`[Browser] listenToMusic called with query: "${query}"`)
+    const searchUrl = `https://music.youtube.com/search?q=${encodeURIComponent(query)}`
+    const result = await this.safeNavigate(searchUrl)
+    if (!result || !this.page) {
+      debugLog(`[Browser] listenToMusic: safeNavigate failed or no page`)
+      return null
+    }
 
     try {
-      const url = `https://open.spotify.com/search/${encodeURIComponent(query)}`
-      await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 })
+      // Try to click the first song result to start playback
+      debugLog(`[Browser] listenToMusic: waiting for song results...`)
+      await this.page.waitForSelector('ytmusic-responsive-list-item-renderer', { timeout: 10000 })
+      const firstSong = this.page.locator('ytmusic-responsive-list-item-renderer').first()
+      await firstSong.click()
+      debugLog(`[Browser] listenToMusic: clicked first song result`)
 
+      // Wait for the player to load and the page title to update.
+      // YouTube Music takes 2-3 seconds to update the page title after playback starts.
+      await this.page.waitForTimeout(3000)
       const title = await this.page.title()
-      console.log(`[Browser] Opened Spotify: ${query}`)
-      return { title }
+      debugLog(`[Browser] listenToMusic: raw page title after 3s wait: "${title}"`)
+      const cleanTitle = title.replace(/\s*-\s*YouTube Music\s*$/i, '').trim()
+      debugLog(`[Browser] listenToMusic: cleaned title: "${cleanTitle}"`)
+
+      const currentUrl = this.page.url()
+      this.lastPageInfo = { title: cleanTitle, url: currentUrl, site: 'YouTube Music' }
+      debugLog(`[Browser] Playing on YouTube Music: "${cleanTitle}" at ${currentUrl}`)
+      return { title: cleanTitle }
     } catch (err) {
-      console.error('[Browser] Spotify error:', err)
-      return null
+      // Navigation succeeded but clicking failed — still usable as a search page
+      const errMsg = (err as Error).message
+      debugLog(`[Browser] YouTube Music click failed: ${errMsg}`)
+      console.warn('[Browser] YouTube Music click failed, staying on search results:', errMsg)
+      this.lastPageInfo = { title: query, url: searchUrl, site: 'YouTube Music' }
+      debugLog(`[Browser] Opened YouTube Music search: ${query}`)
+      return { title: query }
     }
   }
 
@@ -291,24 +489,21 @@ export class BrowserAgent {
    * Browse a generic URL.
    */
   async browseWeb(url: string): Promise<{ title: string } | null> {
-    if (!this.page) return null
-
-    try {
-      await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 })
-      const title = await this.page.title()
-      console.log(`[Browser] Browsing: ${title}`)
-      return { title }
-    } catch (err) {
-      console.error('[Browser] Browse error:', err)
-      return null
+    const result = await this.safeNavigate(url)
+    if (result) {
+      console.log(`[Browser] Browsing: ${result.title}`)
     }
+    return result
   }
 
   /**
    * Browse a random website from a curated list of activities.
+   * Accepts an optional character-specific site list; falls back to generic sites.
    */
-  async browseRandom(): Promise<{ title: string; site: string } | null> {
-    const sites = [
+  async browseRandom(
+    characterSites?: Array<{ url: string; site: string }>
+  ): Promise<{ title: string; site: string } | null> {
+    const defaultSites = [
       { url: 'https://www.pinterest.com', site: 'Pinterest' },
       { url: 'https://twitter.com/explore', site: 'Twitter' },
       { url: 'https://www.reddit.com/r/popular', site: 'Reddit' },
@@ -317,27 +512,37 @@ export class BrowserAgent {
       { url: 'https://news.ycombinator.com', site: 'Hacker News' },
       { url: 'https://www.bilibili.com', site: 'Bilibili' },
     ]
+    const sites = (characterSites && characterSites.length > 0)
+      ? characterSites
+      : defaultSites
 
     const pick = sites[Math.floor(Math.random() * sites.length)]
     const result = await this.browseWeb(pick.url)
     if (result) {
+      this.lastPageInfo = { title: result.title, url: pick.url, site: pick.site }
       return { title: result.title, site: pick.site }
     }
     return null
   }
 
   /**
-   * Get current page title and URL (for context-aware social posting).
+   * Get current page title and URL (for context-aware features).
+   * Returns null if page is dead or on about:blank.
    */
   async getCurrentPageInfo(): Promise<{ title: string; url: string } | null> {
-    if (!this.page) return null
+    if (!this.page || this.pageIsDead) return this.lastPageInfo
     try {
       const title = await this.page.title()
       const url = this.page.url()
-      if (!title || url === 'about:blank') return null
+      if (!title || url === 'about:blank' || url === 'chrome://newtab/') {
+        // Page is on blank — return last known info if we have it
+        return this.lastPageInfo
+      }
+      this.lastPageInfo = { title, url }
       return { title, url }
     } catch {
-      return null /* page may have navigated away */
+      // Page might be dead — return last known info
+      return this.lastPageInfo
     }
   }
 
@@ -359,6 +564,8 @@ export class BrowserAgent {
       this.context = undefined
       this.page = undefined
       this.available = false
+      this.pageIsDead = true
+      this.lastPageInfo = null
       console.log('[Browser] Closed')
     } catch {
       /* Ignore close errors — browser may already be closed */

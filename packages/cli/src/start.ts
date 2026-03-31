@@ -10,17 +10,18 @@
  */
 
 import dotenv from 'dotenv'
-import { resolve } from 'path'
-dotenv.config({ path: resolve(process.env.INIT_CWD ?? process.cwd(), '.env') })
+import { ROOT_DIR, getEnvPath, ensureHomeDirExists } from './paths.js'
+ensureHomeDirExists()
+dotenv.config({ path: getEnvPath() })
 import chalk from 'chalk'
-import { ConversationEngine } from '@opencrush/core'
+import { ConversationEngine, loadCharacterConfig, saveCharacterConfig, migrateFromEnv } from '@opencrush/core'
+import type { CharacterConfig } from '@opencrush/core'
 import { MediaEngine } from '@opencrush/media'
-import { AutonomousScheduler, MusicEngine, DramaEngine, ActivityManager, BrowserAgent, SocialEngine } from '@opencrush/autonomous'
+import { AutonomousScheduler, MusicEngine, DramaEngine, ActivityManager, BrowserAgent, SocialEngine, buildCharacterActivityConfig } from '@opencrush/autonomous'
 import { join } from 'path'
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
 
-const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
 // Use /tmp for PID file so it's always the same path regardless of cwd
 const PID_FILE = '/tmp/opencrush.pid'
 
@@ -126,21 +127,43 @@ export async function startOpencrush(): Promise<void> {
   const config = loadConfig()
   validateConfig(config)
 
+  // ── Load per-character config (platform/voice/twitter/autonomous) ──────
+  const charactersDir = join(ROOT_DIR, 'characters')
+  const characterName = config.CHARACTER_NAME!
+  let charConfig: CharacterConfig = loadCharacterConfig(characterName, charactersDir)
+
+  // Backwards compat: if config.json is blank (no tokens set), migrate from .env
+  const isBlankConfig = !charConfig.discord.botToken && !charConfig.telegram.botToken
+  if (isBlankConfig) {
+    const envPath = getEnvPath()
+    try {
+      charConfig = migrateFromEnv(envPath)
+      saveCharacterConfig(characterName, charactersDir, charConfig)
+      console.log(chalk.gray(`  Migrated platform config to characters/${characterName}/config.json`))
+    } catch {
+      // .env may not have platform keys either — use defaults
+      console.log(chalk.gray(`  No platform config found — using defaults`))
+    }
+  }
+
   // ── Initialize core engine ──────────────────────────────────────────────
   const engine = new ConversationEngine({
-    characterName: config.CHARACTER_NAME,
-    charactersDir: join(ROOT_DIR, 'characters'),
+    characterName: characterName,
+    charactersDir,
     llm: {
       provider: config.LLM_PROVIDER as any,
       // International
       anthropicApiKey: config.ANTHROPIC_API_KEY,
       openaiApiKey: config.OPENAI_API_KEY,
+      xaiApiKey: config.XAI_API_KEY,
       // Chinese providers
       deepseekApiKey: config.DEEPSEEK_API_KEY,
       qwenApiKey: config.DASHSCOPE_API_KEY,
       kimiApiKey: config.MOONSHOT_API_KEY,
       zhipuApiKey: config.ZHIPU_API_KEY,
       minimaxApiKey: config.MINIMAX_API_KEY,
+      minimaxGlobalApiKey: config.MINIMAX_GLOBAL_API_KEY,
+      zaiApiKey: config.ZAI_API_KEY,
       // Local
       ollamaBaseUrl: config.OLLAMA_BASE_URL,
       ollamaModel: config.OLLAMA_MODEL,
@@ -152,7 +175,7 @@ export async function startOpencrush(): Promise<void> {
   })
 
   console.log(chalk.green(`  ✓ ${engine.characterName} is waking up...`))
-  console.log(chalk.gray(`  Provider: ${config.LLM_PROVIDER} | Character dir: ${join(ROOT_DIR, 'characters', config.CHARACTER_NAME!)}`))
+  console.log(chalk.gray(`  Provider: ${config.LLM_PROVIDER} | Character dir: ${join(charactersDir, characterName)}`))
 
 
   // ── Initialize media engine ─────────────────────────────────────────────
@@ -163,11 +186,11 @@ export async function startOpencrush(): Promise<void> {
       referenceModel: config.IMAGE_REFERENCE_MODEL,
     },
     voice: {
-      provider: config.TTS_PROVIDER as any ?? (config.FAL_KEY ? 'fal' : 'elevenlabs'),
-      elevenLabsApiKey: config.ELEVENLABS_API_KEY,
-      elevenLabsVoiceId: config.ELEVENLABS_VOICE_ID,
-      fishAudioApiKey: config.FISH_AUDIO_API_KEY,
-      fishAudioVoiceId: config.FISH_AUDIO_VOICE_ID,
+      provider: (charConfig.voice.provider || config.TTS_PROVIDER) as any ?? (config.FAL_KEY ? 'fal' : 'elevenlabs'),
+      elevenLabsApiKey: charConfig.voice.elevenlabsKey || config.ELEVENLABS_API_KEY,
+      elevenLabsVoiceId: charConfig.voice.elevenlabsVoiceId || config.ELEVENLABS_VOICE_ID,
+      fishAudioApiKey: charConfig.voice.fishAudioKey || config.FISH_AUDIO_API_KEY,
+      fishAudioVoiceId: charConfig.voice.fishAudioVoiceId || config.FISH_AUDIO_VOICE_ID,
       falKey: config.FAL_KEY,
       openaiApiKey: config.OPENAI_API_KEY,
     },
@@ -179,8 +202,21 @@ export async function startOpencrush(): Promise<void> {
 
   console.log(chalk.green(`  ✓ Media engine ready`))
 
-  // ── Initialize activity manager ────────────────────────────────────────
+  // ── Initialize activity manager with character-specific config ─────────
   const activityManager = new ActivityManager()
+
+  // Build character-specific activity config from AUTONOMY.md + SOUL.md + IDENTITY.md
+  const characterActivityConfig = buildCharacterActivityConfig({
+    autonomyMd: engine.characterBlueprint.autonomy,
+    soulMd: engine.characterBlueprint.soul,
+    identityMd: engine.characterBlueprint.identity,
+  })
+
+  // Apply character-specific daily routine (replaces generic DEFAULT_DAILY_ROUTINE)
+  if (characterActivityConfig.routine.length > 0) {
+    activityManager.setRoutine(characterActivityConfig.routine)
+    console.log(chalk.green(`  ✓ Character-specific daily routine loaded for ${engine.characterName}`))
+  }
 
   // Wire activity state into engine so the AI never contradicts its real activity
   engine.setActivityProvider(() => activityManager.describeCurrentActivity())
@@ -197,26 +233,33 @@ export async function startOpencrush(): Promise<void> {
   }
 
   // Social media engine (optional — API v2 preferred, scraper fallback)
-  const hasTwitterOAuth2 = config.TWITTER_CLIENT_ID && config.TWITTER_CLIENT_SECRET
-  const hasTwitterApi = config.TWITTER_API_KEY && config.TWITTER_API_SECRET && config.TWITTER_ACCESS_TOKEN && config.TWITTER_ACCESS_TOKEN_SECRET
+  // Prefer per-character twitter config, fall back to .env
+  const twitterClientId = charConfig.twitter.clientId || config.TWITTER_CLIENT_ID
+  const twitterClientSecret = charConfig.twitter.clientSecret || config.TWITTER_CLIENT_SECRET
+  const twitterApiKey = charConfig.twitter.apiKey || config.TWITTER_API_KEY
+  const twitterApiSecret = charConfig.twitter.apiSecret || config.TWITTER_API_SECRET
+  const twitterAccessToken = charConfig.twitter.accessToken || config.TWITTER_ACCESS_TOKEN
+  const twitterAccessSecret = charConfig.twitter.accessSecret || config.TWITTER_ACCESS_TOKEN_SECRET
+  const hasTwitterOAuth2 = twitterClientId && twitterClientSecret
+  const hasTwitterApi = twitterApiKey && twitterApiSecret && twitterAccessToken && twitterAccessSecret
   const hasTwitterScraper = config.TWITTER_USERNAME && config.TWITTER_PASSWORD
   const hasAnyTwitter = hasTwitterOAuth2 || hasTwitterApi || hasTwitterScraper
   const socialEngine = new SocialEngine({
     twitter: hasAnyTwitter ? {
-      clientId: config.TWITTER_CLIENT_ID,
-      clientSecret: config.TWITTER_CLIENT_SECRET,
+      clientId: twitterClientId,
+      clientSecret: twitterClientSecret,
       oauth2TokenFile: hasTwitterOAuth2 ? join(ROOT_DIR, '.twitter-oauth2-tokens.json') : undefined,
-      apiKey: config.TWITTER_API_KEY ?? config.TWITTER_CONSUMER_KEY,
-      apiSecret: config.TWITTER_API_SECRET ?? config.TWITTER_CONSUMER_SECRET,
-      accessToken: config.TWITTER_ACCESS_TOKEN,
-      accessTokenSecret: config.TWITTER_ACCESS_TOKEN_SECRET,
+      apiKey: twitterApiKey ?? config.TWITTER_CONSUMER_KEY,
+      apiSecret: twitterApiSecret ?? config.TWITTER_CONSUMER_SECRET,
+      accessToken: twitterAccessToken,
+      accessTokenSecret: twitterAccessSecret,
       username: config.TWITTER_USERNAME,
       password: config.TWITTER_PASSWORD,
       email: config.TWITTER_EMAIL,
       cookiePath: join(ROOT_DIR, '.twitter-cookies.json'),
     } : undefined,
-    minPostIntervalMinutes: parseInt(config.SOCIAL_MIN_POST_INTERVAL ?? '120'),
-    autoPost: config.SOCIAL_AUTO_POST === 'true',
+    minPostIntervalMinutes: charConfig.twitter.postInterval || parseInt(config.SOCIAL_MIN_POST_INTERVAL ?? '120'),
+    autoPost: charConfig.twitter.autoPost || config.SOCIAL_AUTO_POST === 'true',
   })
 
   // Initialize social engine (non-blocking — won't crash if unavailable)
@@ -227,15 +270,18 @@ export async function startOpencrush(): Promise<void> {
   // ── Start bridges ───────────────────────────────────────────────────────
   const bridges: Array<{ sendProactiveMessage: (r: any) => Promise<void>; stop: () => Promise<void>; updatePresence?: (a: any) => void }> = []
 
-  if (config.DISCORD_BOT_TOKEN) {
+  // Prefer per-character bridge config, fall back to .env
+  const discordToken = charConfig.discord.botToken || config.DISCORD_BOT_TOKEN
+  const discordEnabled = charConfig.discord.enabled || Boolean(config.DISCORD_BOT_TOKEN)
+  if (discordEnabled && discordToken) {
     const { DiscordBridge } = await import('@opencrush/bridge-discord')
     const discord = new DiscordBridge({
-      token: config.DISCORD_BOT_TOKEN,
-      clientId: config.DISCORD_CLIENT_ID ?? '',
-      ownerId: config.DISCORD_OWNER_ID ?? '',
+      token: discordToken,
+      clientId: charConfig.discord.clientId || (config.DISCORD_CLIENT_ID ?? ''),
+      ownerId: charConfig.discord.ownerId || (config.DISCORD_OWNER_ID ?? ''),
       engine,
       media,
-      voiceConversationEnabled: config.VOICE_CONVERSATION_ENABLED !== 'false',
+      voiceConversationEnabled: charConfig.voice.conversationEnabled || config.VOICE_CONVERSATION_ENABLED !== 'false',
     })
     await discord.start()
     bridges.push(discord)
@@ -248,11 +294,13 @@ export async function startOpencrush(): Promise<void> {
     console.log(chalk.green(`  ✓ Discord bridge connected`))
   }
 
-  if (config.TELEGRAM_BOT_TOKEN) {
+  const telegramToken = charConfig.telegram.botToken || config.TELEGRAM_BOT_TOKEN
+  const telegramEnabled = charConfig.telegram.enabled || Boolean(config.TELEGRAM_BOT_TOKEN)
+  if (telegramEnabled && telegramToken) {
     const { TelegramBridge } = await import('@opencrush/bridge-telegram')
     const telegram = new TelegramBridge({
-      token: config.TELEGRAM_BOT_TOKEN,
-      ownerId: parseInt(config.TELEGRAM_OWNER_ID ?? '0'),
+      token: telegramToken,
+      ownerId: parseInt(charConfig.telegram.ownerId || (config.TELEGRAM_OWNER_ID ?? '0')),
       engine,
       media,
     })
@@ -261,7 +309,8 @@ export async function startOpencrush(): Promise<void> {
     console.log(chalk.green(`  ✓ Telegram bridge connected`))
   }
 
-  if (config.WHATSAPP_ENABLED === 'true') {
+  const whatsappEnabled = charConfig.whatsapp.enabled || config.WHATSAPP_ENABLED === 'true'
+  if (whatsappEnabled) {
     console.log(chalk.yellow(`  ⚡ WhatsApp: Scan the QR code below with your phone...`))
     // WhatsApp bridge uses dynamic import as Baileys has complex deps
     try {
@@ -277,21 +326,25 @@ export async function startOpencrush(): Promise<void> {
 
   if (bridges.length === 0) {
     console.log(chalk.red('\n  ❌ No messaging platforms configured!'))
-    console.log(chalk.gray('  Add at least one: DISCORD_BOT_TOKEN, TELEGRAM_BOT_TOKEN, or WHATSAPP_ENABLED=true in .env\n'))
-    console.log(chalk.yellow('  Quick fix: run "pnpm setup" to reconfigure platforms.'))
-    console.log(chalk.gray('  Or edit .env directly and add your platform token.\n'))
+    console.log(chalk.gray(`  Edit characters/${characterName}/config.json to enable platforms,`))
+    console.log(chalk.gray('  or run "npx opencrush@latest setup" to reconfigure.\n'))
     cleanupPidFile()
     process.exit(1)
   }
 
-  // ── Start autonomous scheduler ──────────────────────────────────────────
+  // ── Start autonomous scheduler with character-specific config ───────────
   const musicEngine = new MusicEngine({
     spotifyClientId: config.SPOTIFY_CLIENT_ID,
     spotifyClientSecret: config.SPOTIFY_CLIENT_SECRET,
+    seedArtists: characterActivityConfig.musicSeedArtists,
+    seedGenres: characterActivityConfig.musicSeedGenres,
+    curatedTracks: characterActivityConfig.curatedTracks,
   })
 
   const dramaEngine = new DramaEngine({
     tmdbApiKey: config.TMDB_API_KEY,
+    preferredGenres: characterActivityConfig.dramaPreferredGenres,
+    curatedShows: characterActivityConfig.curatedShows,
   })
 
   const scheduler = new AutonomousScheduler({
@@ -302,12 +355,14 @@ export async function startOpencrush(): Promise<void> {
     browserAgent,
     socialEngine,
     mediaEngine: media,
-    socialAutoPost: config.SOCIAL_AUTO_POST === 'true',
-    charactersDir: join(ROOT_DIR, 'characters'),
-    quietHoursStart: parseInt(config.QUIET_HOURS_START ?? '23'),
-    quietHoursEnd: parseInt(config.QUIET_HOURS_END ?? '8'),
-    minIntervalMinutes: parseInt(config.PROACTIVE_MESSAGE_MIN_INTERVAL ?? '60'),
-    maxIntervalMinutes: parseInt(config.PROACTIVE_MESSAGE_MAX_INTERVAL ?? '240'),
+    socialAutoPost: charConfig.twitter.autoPost || config.SOCIAL_AUTO_POST === 'true',
+    charactersDir,
+    quietHoursStart: charConfig.autonomous.quietHoursStart || parseInt(config.QUIET_HOURS_START ?? '23'),
+    quietHoursEnd: charConfig.autonomous.quietHoursEnd || parseInt(config.QUIET_HOURS_END ?? '8'),
+    minIntervalMinutes: charConfig.autonomous.proactiveMinInterval || parseInt(config.PROACTIVE_MESSAGE_MIN_INTERVAL ?? '60'),
+    maxIntervalMinutes: charConfig.autonomous.proactiveMaxInterval || parseInt(config.PROACTIVE_MESSAGE_MAX_INTERVAL ?? '240'),
+    youtubeTopics: characterActivityConfig.youtubeTopics,
+    browseSites: characterActivityConfig.browseSites,
     onProactiveMessage: async (trigger) => {
       const response = await engine.generateProactiveMessage(trigger)
       // Send to all active bridges
@@ -360,12 +415,15 @@ function loadConfig(): Record<string, string | undefined> {
     // International
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
     OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    XAI_API_KEY: process.env.XAI_API_KEY,
     // Chinese providers
     DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
     DASHSCOPE_API_KEY: process.env.DASHSCOPE_API_KEY,
     MOONSHOT_API_KEY: process.env.MOONSHOT_API_KEY,
     ZHIPU_API_KEY: process.env.ZHIPU_API_KEY,
     MINIMAX_API_KEY: process.env.MINIMAX_API_KEY,
+    MINIMAX_GLOBAL_API_KEY: process.env.MINIMAX_GLOBAL_API_KEY,
+    ZAI_API_KEY: process.env.ZAI_API_KEY,
     // Local
     OLLAMA_BASE_URL: process.env.OLLAMA_BASE_URL,
     OLLAMA_MODEL: process.env.OLLAMA_MODEL,
@@ -417,18 +475,18 @@ function loadConfig(): Record<string, string | undefined> {
 function validateConfig(config: Record<string, string | undefined>): void {
   if (!config.CHARACTER_NAME) {
     console.log(chalk.red('\n  ❌ CHARACTER_NAME not set in .env'))
-    console.log(chalk.gray('  Run "pnpm setup" to configure, or edit .env directly'))
+    console.log(chalk.gray('  Run "npx opencrush@latest setup" to configure, or edit .env directly'))
     process.exit(1)
   }
 
-  const hasLLM = config.ANTHROPIC_API_KEY || config.OPENAI_API_KEY
+  const hasLLM = config.ANTHROPIC_API_KEY || config.OPENAI_API_KEY || config.XAI_API_KEY
     || config.DEEPSEEK_API_KEY || config.DASHSCOPE_API_KEY
     || config.MOONSHOT_API_KEY || config.ZHIPU_API_KEY || config.MINIMAX_API_KEY
-    || config.LLM_PROVIDER === 'ollama'
+    || config.MINIMAX_GLOBAL_API_KEY || config.ZAI_API_KEY || config.LLM_PROVIDER === 'ollama'
   if (!hasLLM) {
     console.log(chalk.red('\n  ❌ No LLM API key configured'))
     console.log(chalk.gray('  Add one of these to .env:'))
-    console.log(chalk.gray('  ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY'))
+    console.log(chalk.gray('  ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY / DEEPSEEK_API_KEY'))
     console.log(chalk.gray('  DASHSCOPE_API_KEY / MOONSHOT_API_KEY / ZHIPU_API_KEY / MINIMAX_API_KEY'))
     console.log(chalk.gray('  Or set LLM_PROVIDER=ollama for local inference'))
     process.exit(1)

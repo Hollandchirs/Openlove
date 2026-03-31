@@ -14,7 +14,7 @@ import { join } from 'path'
 import { existsSync } from 'fs'
 import { callLLMDirect } from './llm-direct.js'
 
-const ROOT_DIR = process.cwd()
+import { ROOT_DIR } from './paths.js'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -100,7 +100,7 @@ export async function runTestChat(
   if (feeling === 'tweak') {
     console.log(chalk.yellow(`\n  Edit the files in: characters/${characterName}/`))
     console.log(chalk.yellow('  SOUL.md controls personality. IDENTITY.md controls backstory.'))
-    console.log(chalk.gray('  Run `pnpm setup` again when ready.\n'))
+    console.log(chalk.gray('  Run `npx opencrush@latest setup` again when ready.\n'))
     process.exit(0)
   }
 

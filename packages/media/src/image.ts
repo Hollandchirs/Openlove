@@ -102,11 +102,102 @@ export interface SelfieRequest {
 // fal.ai image_size string presets — guaranteed to produce correct aspect ratio
 type FalImageSize = 'portrait_4_3' | 'portrait_16_9' | 'square_hd' | 'square' | 'landscape_4_3' | 'landscape_16_9'
 
+/** Max dimension for reference images */
+const MAX_REF_DIMENSION = 1024
+
+/** JPEG quality for reference compression (92% preserves facial detail) */
+const REF_JPEG_QUALITY = 92
+
+/**
+ * Module-level cache for prepared reference images.
+ * Avoids re-reading from disk and re-compressing with sharp on every
+ * selfie/video call. TTL: 30 minutes (reference images rarely change).
+ */
+const refImageCache = new Map<string, { dataUri: string; timestamp: number }>()
+const REF_IMAGE_CACHE_TTL = 30 * 60 * 1000 // 30 minutes
+
+/** Remove expired entries from a TTL cache on each access. */
+function cleanExpiredEntries<V extends { timestamp: number }>(
+  cache: Map<string, V>,
+  ttl: number
+): void {
+  const now = Date.now()
+  for (const [key, entry] of cache) {
+    if (now - entry.timestamp >= ttl) {
+      cache.delete(key)
+    }
+  }
+}
+
 export class ImageEngine {
   private config: ImageConfig
 
   constructor(config: ImageConfig) {
     this.config = config
+  }
+
+  /**
+   * Compress and resize a reference image before sending to fal.ai.
+   * Large PNG references (e.g. 2 MB RGBA) produce ~2.6 MB base64 data URIs
+   * that cause silent failures. This resizes to max 1024px and encodes as
+   * JPEG at 92% quality, preserving facial detail while staying under limits.
+   * Falls back to raw base64 if sharp is unavailable.
+   *
+   * Results are cached for 30 minutes to avoid redundant disk reads and
+   * sharp compression on repeated calls (e.g., multiple selfies in a session).
+   */
+  private async prepareReferenceImage(imagePath: string): Promise<string> {
+    // Evict stale entries on each access
+    cleanExpiredEntries(refImageCache, REF_IMAGE_CACHE_TTL)
+
+    // Check module-level cache first
+    const cached = refImageCache.get(imagePath)
+    if (cached && Date.now() - cached.timestamp < REF_IMAGE_CACHE_TTL) {
+      debugLog(`[Media/Image] Using cached reference for ${imagePath}`)
+      return cached.dataUri
+    }
+
+    try {
+      const sharp = eval('require')('sharp')
+      const rawBuffer = readFileSync(imagePath)
+      const metadata = await sharp(rawBuffer).metadata()
+      const origW = metadata.width ?? 0
+      const origH = metadata.height ?? 0
+
+      let pipeline = sharp(rawBuffer)
+
+      if (origW > MAX_REF_DIMENSION || origH > MAX_REF_DIMENSION) {
+        pipeline = pipeline.resize({
+          width: MAX_REF_DIMENSION,
+          height: MAX_REF_DIMENSION,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+      }
+
+      const jpegBuffer: Buffer = await pipeline
+        .flatten({ background: { r: 255, g: 255, b: 255 } })
+        .jpeg({ quality: REF_JPEG_QUALITY })
+        .toBuffer()
+
+      debugLog(
+        `[Media/Image] Reference compressed: ${origW}x${origH} -> max ${MAX_REF_DIMENSION}px, ` +
+        `${rawBuffer.length} -> ${jpegBuffer.length} bytes`
+      )
+
+      const dataUri = `data:image/jpeg;base64,${jpegBuffer.toString('base64')}`
+      refImageCache.set(imagePath, { dataUri, timestamp: Date.now() })
+      return dataUri
+    } catch (err) {
+      debugLog(`[Media/Image] sharp unavailable, using raw reference: ${err instanceof Error ? err.message : err}`)
+    }
+
+    const imageData = readFileSync(imagePath)
+    const ext = imagePath.split('.').pop()?.toLowerCase() ?? 'jpg'
+    const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg'
+    const dataUri = `data:${mime};base64,${imageData.toString('base64')}`
+    refImageCache.set(imagePath, { dataUri, timestamp: Date.now() })
+    return dataUri
   }
 
   async generateSelfie(request: SelfieRequest): Promise<Buffer | null> {
@@ -208,8 +299,7 @@ export class ImageEngine {
    * Tries models in order: PuLID → InstantCharacter → IP-Adapter (fallback).
    */
   private async generateWithReference(prompt: string, imagePath: string, imageSize: FalImageSize): Promise<Buffer | null> {
-    const imageData = readFileSync(imagePath)
-    const base64Image = `data:image/jpeg;base64,${imageData.toString('base64')}`
+    const base64Image = await this.prepareReferenceImage(imagePath)
     const dims = this.presetToPixels(imageSize)
 
     const refModel = this.config.referenceModel ?? 'fal-ai/flux-pulid'
@@ -244,9 +334,9 @@ export class ImageEngine {
         prompt,
         reference_image_url: referenceImageUrl,
         image_size: imageSize,
-        guidance_scale: 5,           // slightly higher → sharper details, better prompt adherence
-        num_inference_steps: 28,     // more steps → finer details, smoother skin
-        id_weight: 0.45,            // slightly lower → more natural expression, less "frozen face"
+        guidance_scale: 3.0,         // lower → more natural, less over-processed look
+        num_inference_steps: 35,     // more steps → finer details, smoother skin
+        id_weight: 0.85,            // high → strong face consistency with reference image
       }, this.config.falKey!)
 
       debugLog(`[Media/Image] PuLID result keys: ${JSON.stringify(Object.keys(result))}`)
@@ -268,8 +358,8 @@ export class ImageEngine {
         prompt,
         image_url: imageUrl,
         image_size: imageSize,
-        guidance_scale: 3.5,
-        num_inference_steps: 28,
+        guidance_scale: 3.0,
+        num_inference_steps: 35,
         scale: 1.0,
         num_images: 1,
         output_format: 'jpeg',

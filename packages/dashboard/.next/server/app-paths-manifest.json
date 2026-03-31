@@ -1,0 +1,8 @@
+{
+  "/api/wake/[name]/route": "app/api/wake/[name]/route.js",
+  "/characters/page": "app/characters/page.js",
+  "/api/activity/[name]/route": "app/api/activity/[name]/route.js",
+  "/characters/[name]/page": "app/characters/[name]/page.js",
+  "/characters/create/page": "app/characters/create/page.js",
+  "/page": "app/page.js"
+}

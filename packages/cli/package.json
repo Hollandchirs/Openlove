@@ -1,9 +1,9 @@
 {
   "name": "opencrush",
-  "version": "0.2.0",
-  "description": "Your AI companion lives on your computer. She watches dramas, listens to music, and thinks of you.",
+  "version": "0.3.23",
+  "description": "Your AI companion lives on your device. She watches dramas, listens to music, and thinks of you.",
   "bin": {
-    "opencrush": "./dist/index.js"
+    "opencrush": "dist/index.js"
   },
   "main": "./dist/index.js",
   "exports": {
@@ -11,6 +11,7 @@
   },
   "files": [
     "dist/",
+    "templates/",
     "README.md",
     "package.json"
   ],
@@ -37,7 +38,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Hollandchirs/Opencrush"
+    "url": "git+https://github.com/Hollandchirs/Opencrush.git"
   },
   "homepage": "https://github.com/Hollandchirs/Opencrush",
   "license": "MIT",
@@ -52,23 +53,24 @@
     "openai": "^4.0.0"
   },
   "devDependencies": {
-    "@opencrush/core": "workspace:*",
+    "@anthropic-ai/sdk": "^0.32.0",
+    "@opencrush/autonomous": "workspace:*",
     "@opencrush/bridge-discord": "workspace:*",
     "@opencrush/bridge-telegram": "workspace:*",
+    "@opencrush/core": "workspace:*",
     "@opencrush/media": "workspace:*",
-    "@opencrush/autonomous": "workspace:*",
-    "@anthropic-ai/sdk": "^0.32.0",
-    "dotenv": "^16.4.7",
-    "inquirer": "^12.3.0",
-    "chalk": "^5.3.0",
-    "figlet": "^1.8.0",
-    "ora": "^8.1.1",
-    "boxen": "^8.0.1",
-    "zod": "^3.24.0",
-    "gray-matter": "^4.0.3",
+    "@types/better-sqlite3": "^7.6.12",
     "@types/figlet": "^1.7.0",
     "@types/inquirer": "^9.0.7",
+    "boxen": "^8.0.1",
+    "chalk": "^5.3.0",
+    "dotenv": "^16.4.7",
+    "figlet": "^1.8.0",
+    "gray-matter": "^4.0.3",
+    "inquirer": "^12.3.0",
+    "ora": "^8.1.1",
+    "tsup": "^8.3.0",
     "typescript": "^5.7.0",
-    "tsup": "^8.3.0"
+    "zod": "^3.24.0"
   }
 }

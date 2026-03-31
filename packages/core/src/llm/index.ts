@@ -16,25 +16,31 @@ import OpenAI from 'openai'
 // ── Provider type ──────────────────────────────────────────────────────────
 
 export type LLMProvider =
-  | 'anthropic'   // https://console.anthropic.com
-  | 'openai'      // https://platform.openai.com
-  | 'deepseek'    // https://platform.deepseek.com  (CN + overseas, no VPN needed)
-  | 'qwen'        // https://dashscope.aliyun.com   (阿里通义千问)
-  | 'kimi'        // https://platform.moonshot.cn   (月之暗面 Moonshot)
-  | 'zhipu'       // https://open.bigmodel.cn       (智谱 GLM)
-  | 'minimax'     // https://platform.minimaxi.com  (MiniMax)
-  | 'ollama'      // local
+  | 'anthropic'       // https://console.anthropic.com
+  | 'openai'          // https://platform.openai.com
+  | 'xai'             // https://console.x.ai (Grok)
+  | 'deepseek'        // https://platform.deepseek.com
+  | 'qwen'            // https://dashscope.aliyun.com (Alibaba)
+  | 'kimi'            // https://platform.moonshot.cn (Moonshot)
+  | 'zhipu'           // https://open.bigmodel.cn (GLM / Zhipu AI)
+  | 'minimax'         // https://api.minimaxi.com (MiniMax China)
+  | 'minimax-global'  // https://api.minimax.io (MiniMax Global)
+  | 'zai'             // https://api.lingyiwanwu.com (01.AI Yi)
+  | 'ollama'          // local
 
 // ── OpenAI-compatible provider metadata ───────────────────────────────────
 
 export const OPENAI_COMPAT_PROVIDERS: Record<string, { baseURL: string; defaultModel: string }> = {
   openai:   { baseURL: '',                                                        defaultModel: 'gpt-4o-mini' },
+  xai:      { baseURL: 'https://api.x.ai/v1',                                    defaultModel: 'grok-4-1-fast-non-reasoning' },
   deepseek: { baseURL: 'https://api.deepseek.com',                               defaultModel: 'deepseek-chat' },
   qwen:     { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',      defaultModel: 'qwen-max' },
   kimi:     { baseURL: 'https://api.moonshot.cn/v1',                             defaultModel: 'moonshot-v1-8k' },
   zhipu:    { baseURL: 'https://open.bigmodel.cn/api/paas/v4',                   defaultModel: 'glm-4-flash' },
-  minimax:  { baseURL: 'https://api.minimax.chat/v1',                            defaultModel: 'abab6.5s-chat' },
-  ollama:   { baseURL: 'http://localhost:11434/v1',                               defaultModel: 'qwen2.5:7b' },
+  minimax:          { baseURL: 'https://api.minimaxi.com/v1',                     defaultModel: 'MiniMax-Text-01' },
+  'minimax-global': { baseURL: 'https://api.minimax.io/v1',                      defaultModel: 'MiniMax-Text-01' },
+  zai:              { baseURL: 'https://api.lingyiwanwu.com/v1',                 defaultModel: 'yi-lightning' },
+  ollama:           { baseURL: 'http://localhost:11434/v1',                       defaultModel: 'qwen2.5:7b' },
 }
 
 // ── Config interface ───────────────────────────────────────────────────────
@@ -45,13 +51,16 @@ export interface LLMConfig {
   // International
   anthropicApiKey?: string
   openaiApiKey?: string
+  xaiApiKey?: string
 
   // Chinese providers (all OpenAI-compatible)
   deepseekApiKey?: string
-  qwenApiKey?: string       // DASHSCOPE_API_KEY
-  kimiApiKey?: string       // MOONSHOT_API_KEY
+  qwenApiKey?: string             // DASHSCOPE_API_KEY
+  kimiApiKey?: string             // MOONSHOT_API_KEY
   zhipuApiKey?: string
-  minimaxApiKey?: string
+  minimaxApiKey?: string          // MiniMax China
+  minimaxGlobalApiKey?: string    // MiniMax Global (different endpoint)
+  zaiApiKey?: string              // 01.AI Yi (ZAI_API_KEY)
 
   // Local
   ollamaBaseUrl?: string
@@ -288,12 +297,15 @@ export class LLMRouter {
   private resolveApiKey(config: LLMConfig): string | undefined {
     const map: Partial<Record<LLMProvider, string | undefined>> = {
       openai:   config.openaiApiKey,
+      xai:      config.xaiApiKey,
       deepseek: config.deepseekApiKey,
       qwen:     config.qwenApiKey,
       kimi:     config.kimiApiKey,
       zhipu:    config.zhipuApiKey,
-      minimax:  config.minimaxApiKey,
-      ollama:   'ollama',
+      minimax:          config.minimaxApiKey,
+      'minimax-global': config.minimaxGlobalApiKey,
+      zai:              config.zaiApiKey,
+      ollama:           'ollama',
     }
     return map[config.provider]
   }

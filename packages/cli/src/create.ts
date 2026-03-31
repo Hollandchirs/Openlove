@@ -19,7 +19,8 @@ import { exec } from 'child_process'
 import { PRESETS, CharacterPreset, AppearanceConfig } from './presets.js'
 import { callLLMDirect } from './llm-direct.js'
 
-const ROOT_DIR = process.env.INIT_CWD ?? process.cwd()
+import { ROOT_DIR, getCharactersDir, getTemplatesDir, ensureHomeDirExists } from './paths.js'
+ensureHomeDirExists()
 
 export interface CreatedCharacter {
   folderName: string
@@ -227,11 +228,20 @@ async function createFromPreset(
     backstory,
   }
 
-  // 4. Portrait
-  const spinner = ora('Saving character files...').start()
-  const blueprint = buildBlueprintFromPreset(config)
+  // 4. Enrich with LLM if API key available, then save
+  const spinner = ora('Building character files...').start()
+  let blueprint = buildBlueprintFromPreset(config)
+  if (apiKey && provider) {
+    try {
+      blueprint = await enrichBlueprintWithLLM(blueprint, config, apiKey, provider)
+      spinner.succeed(chalk.green(`${displayName} created!`))
+    } catch {
+      spinner.succeed(chalk.green(`${displayName} created! (basic — add API key for richer files)`))
+    }
+  } else {
+    spinner.succeed(chalk.green(`${displayName} created!`))
+  }
   writeCharacterFiles(folderName, blueprint)
-  spinner.succeed(chalk.green(`${displayName} created!`))
 
   const { hasPortrait, falKey } = await craftPortrait(config, folderName, apiKey, provider)
 
@@ -427,7 +437,7 @@ async function craftPortrait(
       mask: '*',
     }])
     if (!inputKey) {
-      console.log(chalk.gray('  Skipping portrait — add FAL_KEY to .env and run: pnpm create-character\n'))
+      console.log(chalk.gray('  Skipping portrait — add FAL_KEY to .env and run: npx opencrush@latest create\n'))
       return { hasPortrait: false }
     }
     falKey = inputKey
@@ -450,6 +460,11 @@ async function craftPortrait(
   console.log(chalk.gray(`\n  Portrait prompt:\n  ${chalk.italic(finalPrompt.slice(0, 120))}...\n`))
 
   // Generate loop
+  if (!falKey) {
+    console.log(chalk.red('FAL_KEY required'))
+    return { hasPortrait: false }
+  }
+
   const destPath = join(ROOT_DIR, 'characters', folderName, 'reference.jpg')
   let attempts = 0
 
@@ -530,7 +545,7 @@ function buildPortraitPrompt(config: SculptedConfig): string {
     `wearing ${appearance.fashionStyle} style`,
     archetype.portraitBase,
     vibeHints,
-    'cinematic photography, ultra-detailed, 8k resolution, professional studio lighting, beautiful, editorial fashion, sharp focus',
+    'cinematic photography, ultra-detailed, 8k resolution, beautiful, editorial fashion, sharp focus, atmospheric background matching character aesthetic, environmental storytelling, moody scene lighting',
   ]
 
   return parts.filter(Boolean).join(', ')
@@ -542,16 +557,20 @@ async function optimizePortraitPrompt(
   apiKey: string,
   provider: string
 ): Promise<string> {
-  const system = `You are an expert at writing image generation prompts for portrait photography.
+  const system = `You are an expert at writing image generation prompts for character portraits.
 Given a character description and base prompt, write an optimized FLUX/Stable Diffusion prompt.
-Rules: under 200 words, focus on visual details only, include quality tags, match the character's aesthetic.
+Rules:
+- Under 200 words, focus on visual details, include quality tags
+- ALWAYS include a scene-appropriate background that matches the character's vibe and lifestyle (e.g. neon cityscape for cyberpunk, cozy café for warm characters, art studio for artists, rain-soaked street for moody characters)
+- NEVER use plain white, studio, or blank backgrounds
+- The background should tell a story about who this character is
 Return ONLY the prompt text — no explanation, no quotes.`
 
   const userMsg = `Character: ${config.name}, ${config.gender}
 Archetype: ${config.archetype.label}
 Base prompt: ${basePrompt}
 
-Optimize this into a vivid, effective portrait generation prompt. Preserve all physical details.`
+Optimize this into a vivid portrait prompt with an atmospheric background that fits the character's world. Preserve all physical details.`
 
   try {
     const result = await callLLMDirect(provider, apiKey, system, [{ role: 'user', content: userMsg }], 300)
@@ -602,6 +621,56 @@ function openImage(filePath: string): void {
     process.platform === 'win32'  ? `start "" "${filePath}"` :
     `xdg-open "${filePath}"`
   exec(cmd, () => { /* ignore errors */ })
+}
+
+// ── LLM ENRICHMENT ──────────────────────────────────────────────────────────
+
+/**
+ * Takes a skeletal blueprint and uses LLM to expand it into rich, detailed prose.
+ * Transforms bullet-point appearance into vivid paragraphs, adds Background section.
+ */
+async function enrichBlueprintWithLLM(
+  blueprint: { identity: string; soul: string; user: string; memory: string },
+  config: SculptedConfig,
+  apiKey: string,
+  provider: string
+): Promise<{ identity: string; soul: string; user: string; memory: string }> {
+  const system = `You are a character writer creating rich companion profiles. Write in second person removed — describe the character as they are, not to them. Be specific, vivid, contradictory. Real people have texture.
+
+RULES:
+- Expand appearance into 2-3 paragraphs of vivid prose (not bullet points)
+- Add a ## Background section (2-3 paragraphs about their history, how they got here)
+- Flesh out the SOUL with specific examples, not generic traits
+- Keep the markdown structure and frontmatter exactly as given
+- Write in English only
+- Do NOT add any sections that aren't in the original
+- Return the FULL expanded file content, not just the additions`
+
+  const identityPrompt = `Expand this IDENTITY.md into a rich, detailed character file. The appearance section should be vivid prose paragraphs (like a novel character introduction), not a list. Add a ## Background section at the end with 2-3 paragraphs of backstory.
+
+Current file:
+${blueprint.identity}
+
+Character context: ${config.archetype.label} archetype, personality traits: ${config.personality.join(', ')}${config.backstory ? ', backstory moment: ' + config.backstory : ''}`
+
+  const soulPrompt = `Expand this SOUL.md into a richer version. Add specific examples to each section. The "Voice & Vibe" section should be 2+ paragraphs. "Loves" and "Dislikes" should have 5-7 items each with colorful detail. Add a "## Things She Does" section with 6-8 specific behavioral habits. Keep the same structure.
+
+Current file:
+${blueprint.soul}`
+
+  const [enrichedIdentity, enrichedSoul] = await Promise.all([
+    callLLMDirect(provider, apiKey, system, [{ role: 'user', content: identityPrompt }], 2000)
+      .catch(() => blueprint.identity),
+    callLLMDirect(provider, apiKey, system, [{ role: 'user', content: soulPrompt }], 2000)
+      .catch(() => blueprint.soul),
+  ])
+
+  return {
+    identity: enrichedIdentity || blueprint.identity,
+    soul: enrichedSoul || blueprint.soul,
+    user: blueprint.user,
+    memory: blueprint.memory,
+  }
 }
 
 // ── BUILD BLUEPRINT FROM PRESET + SCULPTING ────────────────────────────────
@@ -865,7 +934,7 @@ async function createBlank(): Promise<CreatedCharacter> {
   const dir = join(ROOT_DIR, 'characters', folderName)
   mkdirSync(dir, { recursive: true })
 
-  const templatesDir = join(ROOT_DIR, 'templates')
+  const templatesDir = getTemplatesDir()
   for (const file of ['IDENTITY.md', 'SOUL.md', 'USER.md', 'MEMORY.md']) {
     const src = join(templatesDir, file)
     const dst = join(dir, file)
@@ -879,7 +948,7 @@ async function createBlank(): Promise<CreatedCharacter> {
 
   console.log(chalk.cyan(`\n  ✓ Created characters/${folderName}/`))
   console.log(chalk.gray('  Edit the 4 markdown files to define your companion.'))
-  console.log(chalk.gray('  Then run: pnpm start\n'))
+  console.log(chalk.gray('  Then run: npx opencrush@latest start\n'))
 
   return { folderName, displayName: name, gender, hasPortrait: false }
 }

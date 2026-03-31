@@ -130,14 +130,30 @@ export class RelationshipTracker {
     const s = this.state
 
     const stageDescriptions: Record<RelationshipStage, string> = {
-      stranger: 'You just met this person. Be friendly but appropriately reserved. Ask basic getting-to-know-you questions.',
-      acquaintance: 'You know this person a little. You can be warmer but still discovering who they are.',
-      friend: 'You consider this person a friend. Be comfortable, share opinions freely, joke around.',
-      close_friend: 'This is one of your closest friends. Be emotionally open, reference shared memories, tease affectionately.',
-      intimate: 'You are extremely close to this person. Be deeply authentic, vulnerable, and caring. You know them well.',
+      stranger: 'This person is a STRANGER — likely a fan. You do NOT know them. ' +
+        'Keep your idol wall UP. Be polite but distant. Do NOT act familiar, affectionate, or intimate. ' +
+        'Short responses. Cool energy. You have not earned each other\'s trust.',
+      acquaintance: 'You barely know this person — a few conversations at most. ' +
+        'You can be a bit warmer but you are still guarded. Do NOT overshare or act like close friends. ' +
+        'Surface-level teasing only. No vulnerability. No pet names.',
+      friend: 'You consider this person a friend. Be comfortable, share opinions freely, joke around. ' +
+        'You can show more of your real personality but still have some boundaries.',
+      close_friend: 'This is one of your closest friends. Be emotionally open, reference shared memories, tease affectionately. ' +
+        'You can be vulnerable and share things you normally wouldn\'t.',
+      intimate: 'You are extremely close to this person. Be deeply authentic, vulnerable, and caring. ' +
+        'You know them well. The walls are down.',
     }
 
     const parts = [stageDescriptions[s.stage]]
+
+    // Add concrete stats to help the LLM calibrate
+    if (s.totalMessages <= 5) {
+      parts.push('You have barely exchanged any messages. This is a new interaction.')
+    } else if (s.totalMessages <= 20) {
+      parts.push(`Only ${s.totalMessages} messages exchanged so far — still very early.`)
+    } else if (s.totalMessages <= 50) {
+      parts.push(`${s.totalMessages} messages exchanged — getting to know each other.`)
+    }
 
     if (s.currentStreak > 3) {
       parts.push(`You've been chatting every day for ${s.currentStreak} days straight.`)
@@ -289,6 +305,40 @@ export class RelationshipTracker {
 
     // Persist
     this.saveState(this.state)
+  }
+
+  /**
+   * Set a minimum stage floor from USER.md content.
+   * When the user and character have established a relationship in conversation
+   * (e.g., USER.md says "boyfriend/girlfriend"), the stage should never drop
+   * below that level regardless of numeric scores.
+   */
+  setStageFloor(userMdContent: string): void {
+    const lower = userMdContent.toLowerCase()
+    let floor: RelationshipStage = 'stranger'
+
+    if (lower.includes('intimate') || lower.includes('partner') || lower.includes('love') ||
+        lower.includes('boyfriend') || lower.includes('girlfriend') || lower.includes('married') ||
+        lower.includes('soulmate')) {
+      floor = 'intimate'
+    } else if (lower.includes('close friend') || lower.includes('best friend') ||
+               lower.includes('bff') || lower.includes('deeply trust')) {
+      floor = 'close_friend'
+    } else if (lower.includes('friend') && !lower.includes('stranger')) {
+      floor = 'friend'
+    } else if (lower.includes('acquaintance') || lower.includes('getting to know')) {
+      floor = 'acquaintance'
+    }
+
+    if (floor !== 'stranger') {
+      const floorThreshold = STAGE_THRESHOLDS[floor]
+      // If current closeness is below the floor stage threshold, boost it
+      if (this.state.closeness < floorThreshold) {
+        this.state.closeness = floorThreshold + 0.01
+        this.state.stage = floor
+        this.saveState(this.state)
+      }
+    }
   }
 
   private resolveStage(): RelationshipStage {

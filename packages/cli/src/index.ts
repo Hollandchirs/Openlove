@@ -9,8 +9,12 @@
  *   opencrush status   — Show current status
  */
 
-import 'dotenv/config'
 import chalk from 'chalk'
+import { ROOT_DIR, getEnvPath, getCharactersDir, isConfigured, ensureHomeDirExists } from './paths.js'
+import dotenv from 'dotenv'
+import { existsSync } from 'fs'
+
+dotenv.config({ path: getEnvPath() })
 
 const [, , command] = process.argv
 
@@ -25,18 +29,13 @@ async function main(): Promise<void> {
 
     case 'start':
     case undefined: {
-      // Default action if no command given — check if setup is done
-      const { existsSync } = await import('fs')
-      const { join } = await import('path')
-      const rootDir = process.env.INIT_CWD ?? process.cwd()
-
-      if (!existsSync(join(rootDir, '.env'))) {
-        console.log(chalk.yellow('\n  No .env found. Running setup wizard...\n'))
+      ensureHomeDirExists()
+      if (!isConfigured()) {
+        console.log(chalk.yellow('\n  First run — launching setup wizard...\n'))
         const { runSetupWizard } = await import('./setup.js')
         await runSetupWizard()
         return
       }
-
       const { startOpencrush } = await import('./start.js')
       await startOpencrush()
       break
@@ -45,12 +44,8 @@ async function main(): Promise<void> {
     case 'wakeup':
     case 'wake':
     case 'restart': {
-      const { existsSync } = await import('fs')
-      const { join } = await import('path')
-      const rootDir = process.env.INIT_CWD ?? process.cwd()
-
-      if (!existsSync(join(rootDir, '.env'))) {
-        console.log(chalk.yellow('\n  No .env found. Running setup first...\n'))
+      if (!isConfigured()) {
+        console.log(chalk.yellow('\n  No config found. Running setup first...\n'))
         const { runSetupWizard } = await import('./setup.js')
         await runSetupWizard()
       }
@@ -72,15 +67,15 @@ async function main(): Promise<void> {
     }
 
     case 'status': {
-      const { existsSync, readdirSync } = await import('fs')
+      const { readdirSync } = await import('fs')
       const { join } = await import('path')
 
       console.log(chalk.magenta('\n  💝 Opencrush Status\n'))
 
-      const hasEnv = existsSync(join(process.cwd(), '.env'))
-      console.log(`  Config: ${hasEnv ? chalk.green('✓ .env found') : chalk.red('✗ No .env — run: pnpm setup')}`)
+      console.log(`  Config: ${isConfigured() ? chalk.green('✓ configured') : chalk.red('✗ Not configured — run: npx opencrush@latest setup')}`)
+      console.log(`  Root: ${chalk.gray(ROOT_DIR)}`)
 
-      const charactersDir = join(process.cwd(), 'characters')
+      const charactersDir = getCharactersDir()
       if (existsSync(charactersDir)) {
         const chars = readdirSync(charactersDir, { withFileTypes: true })
           .filter(d => d.isDirectory()).map(d => d.name)
@@ -103,8 +98,7 @@ async function main(): Promise<void> {
       const Database = (await import('better-sqlite3')).default
 
       const charName = process.env.CHARACTER_NAME ?? 'helora'
-      const rootDir = process.env.INIT_CWD ?? process.cwd()
-      const charDir = join(rootDir, 'characters', charName)
+      const charDir = join(getCharactersDir(), charName)
       const dbPath = join(charDir, 'memory.db')
 
       if (!existsSync(dbPath)) {
@@ -286,8 +280,7 @@ async function main(): Promise<void> {
       const Database = (await import('better-sqlite3')).default
 
       const charName = process.env.CHARACTER_NAME ?? 'helora'
-      const rootDir = process.env.INIT_CWD ?? process.cwd()
-      const dbPath = join(rootDir, 'characters', charName, 'memory.db')
+      const dbPath = join(getCharactersDir(), charName, 'memory.db')
 
       if (!existsSync(dbPath)) {
         console.log(chalk.red(`\n  No memory found for "${charName}".\n`))
@@ -352,32 +345,33 @@ async function main(): Promise<void> {
     case 'help':
     case '-h': {
       console.log(`
-  ${chalk.magenta('💝 Opencrush')} — Your AI companion
+  ${chalk.magenta('💝 Opencrush')} — Your AI companion lives on your device
 
   ${chalk.bold('Usage:')}
-    ${chalk.cyan('pnpm setup')}        First-time setup wizard
-    ${chalk.cyan('pnpm start')}        Start your companion
-    ${chalk.cyan('pnpm wakeup')}       Kill existing process + restart
-    ${chalk.cyan('pnpm create-character')}   Create a new companion
-    ${chalk.cyan('pnpm status')}       Show current status
-    ${chalk.cyan('opencrush memory')}  View AI's memory, relationship, and impressions
-    ${chalk.cyan('opencrush card <name>')}   Generate a character card image
-    ${chalk.cyan('opencrush export <name>')} Export character as .tar.gz
-    ${chalk.cyan('opencrush import <file|url>')} Import a character package
+    ${chalk.cyan('npx opencrush@latest')}          First-time setup (auto-detected)
+    ${chalk.cyan('npx opencrush@latest setup')}    Run setup wizard
+    ${chalk.cyan('npx opencrush@latest start')}    Start your companion
+    ${chalk.cyan('npx opencrush@latest wakeup')}   Kill existing process + restart
+    ${chalk.cyan('npx opencrush@latest create')}   Create a new companion
+    ${chalk.cyan('npx opencrush@latest status')}   Show current status
+    ${chalk.cyan('npx opencrush@latest memory')}   View AI's memory & relationship
+    ${chalk.cyan('npx opencrush@latest card <name>')}   Generate a character card image
+    ${chalk.cyan('npx opencrush@latest export <name>')} Export character as .tar.gz
+    ${chalk.cyan('npx opencrush@latest import <file|url>')} Import a character package
 
-  ${chalk.bold('Files:')}
-    ${chalk.gray('.env')}              Your API keys and settings
-    ${chalk.gray('characters/<name>/')} Your companion's blueprint files
+  ${chalk.bold('Config & Data:')}
+    ${chalk.gray(ROOT_DIR + '/.env')}         Your API keys and settings
+    ${chalk.gray(ROOT_DIR + '/characters/')}  Your companion's blueprint files
 
   ${chalk.bold('Documentation:')}
-    ${chalk.gray('https://github.com/Hollandchirs/Opencrush')}
+    ${chalk.gray('https://github.com/heloraai/Opencrush')}
       `)
       break
     }
 
     default:
       console.log(chalk.red(`\n  Unknown command: ${command}`))
-      console.log(chalk.gray('  Run "pnpm help" for usage\n'))
+      console.log(chalk.gray('  Run "npx opencrush@latest help" for usage\n'))
       process.exit(1)
   }
 }

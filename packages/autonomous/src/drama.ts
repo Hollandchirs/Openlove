@@ -15,6 +15,8 @@ export interface DramaConfig {
   // Show preferences extracted from SOUL.md
   preferredGenres?: string[]
   preferredLanguages?: string[]
+  /** Character-specific curated shows (replaces generic fallback list) */
+  curatedShows?: EpisodeInfo[]
   // SQLite database for persistence (optional — falls back to in-memory)
   db?: Database.Database
 }
@@ -166,8 +168,9 @@ export class DramaEngine {
   }
 
   private async startNewShow(): Promise<EpisodeInfo> {
-    // Curated list of popular shows by genre for fallback
-    const popularShows: EpisodeInfo[] = [
+    // Use character-specific curated shows if available
+    const characterShows = this.config.curatedShows
+    const genericShows: EpisodeInfo[] = [
       { showName: 'Crash Landing on You', season: 1, episode: 1, episodeTitle: 'Episode 1', summary: 'A South Korean heiress accidentally paraglides into North Korea and meets an army officer who tries to help her.' },
       { showName: 'My Demon', season: 1, episode: 1, episodeTitle: 'Episode 1', summary: 'A devil who lost his powers and a ruthless heiress are bound by a mysterious mark.' },
       { showName: 'Queen of Tears', season: 1, episode: 1, episodeTitle: 'Episode 1', summary: 'A powerful department store heiress and her husband face a marriage crisis and unexpected circumstances.' },
@@ -176,6 +179,9 @@ export class DramaEngine {
       { showName: 'Arcane', season: 2, episode: 1, episodeTitle: 'The Monster You Made', summary: 'The sisters are on a collision course that threatens to tear two cities apart.' },
       { showName: 'Only Murders in the Building', season: 3, episode: 1, episodeTitle: 'Showstopper', summary: 'An unexpected death during a Broadway musical\'s opening night kicks off a new mystery.' },
     ]
+    const popularShows = (characterShows && characterShows.length > 0)
+      ? characterShows
+      : genericShows
 
     const show = popularShows[Math.floor(Math.random() * popularShows.length)]
 
