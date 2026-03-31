@@ -40,6 +40,13 @@ export function findRepoRoot(): string {
     dir = parent;
   }
 
+  // During Next.js build (SSG/ISR), .env and characters/ may not exist.
+  // Return a fallback so the build completes — runtime routes will
+  // re-resolve when actually called.
+  if (process.env.NODE_ENV === "production" || process.env.NEXT_PHASE === "phase-production-build") {
+    return process.cwd();
+  }
+
   throw new Error(
     "Cannot find repo root (.env + characters/). Run `npx opencrush@latest setup` first."
   );
